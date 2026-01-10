@@ -160,7 +160,7 @@ class MDTVTransformer(nn.Module):
             nn.Linear(proprio_dim, embed_dim * 2),
             nn.Mish(),
             nn.Linear(embed_dim * 2, embed_dim),
-        ).to(self.device)
+        )
 
         self.block_size = block_size
         self.goal_seq_len = goal_seq_len
@@ -171,7 +171,7 @@ class MDTVTransformer(nn.Module):
             nn.Linear(embed_dim, embed_dim * 2),
             nn.Mish(),
             nn.Linear(embed_dim * 2, embed_dim),
-        ).to(self.device)
+        )
 
         self.action_emb = nn.Linear(action_dim, embed_dim)
 

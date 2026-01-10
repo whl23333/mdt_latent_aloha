@@ -12,7 +12,8 @@ class VisionClip(nn.Module):
         super(VisionClip, self).__init__()
         # Load CLIP model
         print(f"loading vision CLIP model with backbone: {model_name}")
-        self.clip_model, _ = load_clip(model_name, device=device)
+        # Construct CLIP on CPU to avoid eager CUDA init; PL will move to device later
+        self.clip_model, _ = load_clip(model_name, device=torch.device('cpu'))
         if freeze_backbone:
             for param in self.clip_model.parameters():
                 param.requires_grad = False
@@ -37,7 +38,8 @@ class DefaultVisionClip(nn.Module):
         super(DefaultVisionClip, self).__init__()
         # Load CLIP model
         print(f"loading vision CLIP model with backbone: {model_name}")
-        self.clip_model, _ = load_clip(model_name, device=device)
+        # Construct CLIP on CPU to avoid eager CUDA init; PL will move to device later
+        self.clip_model, _ = load_clip(model_name, device=torch.device('cpu'))
         if freeze_backbone:
             for param in self.clip_model.parameters():
                 param.requires_grad = False
@@ -54,7 +56,8 @@ class TokenVisionClip(nn.Module):
         super(TokenVisionClip, self).__init__()
         # Load CLIP model
         print(f"loading vision CLIP model with backbone: {model_name}")
-        self.clip_model, _ = load_clip(model_name, device=device)
+        # Construct CLIP on CPU to avoid eager CUDA init; PL will move to device later
+        self.clip_model, _ = load_clip(model_name, device=torch.device('cpu'))
         if freeze_backbone:
             for param in self.clip_model.parameters():
                 param.requires_grad = False

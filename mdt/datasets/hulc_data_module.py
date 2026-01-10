@@ -10,10 +10,13 @@ import pytorch_lightning as pl
 from pytorch_lightning.trainer.supporters import CombinedLoader
 from torch.utils.data import DataLoader
 import torchvision
+import sys
 
 import mdt
 from mdt.datasets.utils.episode_utils import load_dataset_statistics
 from mdt.datasets.utils.shared_memory_utils import load_shm_lookup, save_shm_lookup, SharedMemoryLoader
+import torch
+from mdt.datasets.samplers import EpochRandomSubsetSampler
 
 logger = logging.getLogger(__name__)
 DEFAULT_TRANSFORM = OmegaConf.create({"train": None, "val": None})
@@ -28,6 +31,12 @@ class HulcDataModule(pl.LightningDataModule):
         num_workers: int = 8,
         transforms: DictConfig = DEFAULT_TRANSFORM,
         shuffle_val: bool = False,
+        # Sampler options
+        use_epoch_sampler: bool = False,
+        sampler_fraction: float = 1.0,
+        resample_each_epoch: bool = False,
+        sampler_drop_remainder: bool = False,
+        sampler_seed: int = 0,
         **kwargs: Dict,
     ):
         super().__init__()
@@ -37,6 +46,12 @@ class HulcDataModule(pl.LightningDataModule):
         self.train_sampler = None
         self.val_sampler = None
         self.num_workers = num_workers
+        # Sampler config
+        self.use_epoch_sampler = use_epoch_sampler
+        self.sampler_fraction = sampler_fraction
+        self.resample_each_epoch = resample_each_epoch
+        self.sampler_drop_remainder = sampler_drop_remainder
+        self.sampler_seed = sampler_seed
         root_data_path = Path(root_data_dir)
         if not root_data_path.is_absolute():
             root_data_path = Path(mdt.__file__).parent / root_data_path
@@ -62,14 +77,24 @@ class HulcDataModule(pl.LightningDataModule):
 
         # download and unpack images
         if not dataset_exist:
-            if "CI" not in os.environ:
+            # Non-interactive safe behavior: auto-download debug dataset when no TTY or in CI.
+            interactive = sys.stdin.isatty()
+            want_download = True
+            if interactive and ("CI" not in os.environ):
                 print(f"No dataset found in {self.training_dir}.")
                 print("For information how to download to full CALVIN dataset, please visit")
                 print("https://github.com/mees/calvin/tree/main/dataset")
                 print("Do you wish to download small debug dataset to continue training?")
-                s = input("YES / no")
-                if s == "no":
-                    exit()
+                try:
+                    s = input("YES / no").strip().lower()
+                    want_download = (s != "no")
+                except Exception:
+                    # If input fails, default to download to avoid crashing.
+                    want_download = True
+            if not want_download:
+                raise RuntimeError(
+                    f"Dataset not found in {self.training_dir}. Aborting per user choice."
+                )
             logger.info(f"downloading dataset to {self.training_dir} and {self.val_dir}")
             torchvision.datasets.utils.download_and_extract_archive(ONE_EP_DATASET_URL, self.training_dir)
             torchvision.datasets.utils.download_and_extract_archive(ONE_EP_DATASET_URL, self.val_dir)
@@ -134,17 +159,37 @@ class HulcDataModule(pl.LightningDataModule):
                 self.modalities.append(key)
 
     def train_dataloader(self):
-        return {
-            key: DataLoader(
-                dataset,
-                batch_size=dataset.batch_size,
-                num_workers=dataset.num_workers,
-                pin_memory=True,
-                shuffle=True,
-                prefetch_factor=2,
-            )
-            for key, dataset in self.train_datasets.items()
-        }
+        loaders = {}
+        self.train_samplers = {}
+        for key, dataset in self.train_datasets.items():
+            if self.use_epoch_sampler and self.sampler_fraction < 1.0:
+                sampler = EpochRandomSubsetSampler(
+                    dataset,
+                    fraction=self.sampler_fraction,
+                    seed=self.sampler_seed,
+                    resample_each_epoch=self.resample_each_epoch,
+                    drop_remainder=self.sampler_drop_remainder,
+                )
+                self.train_samplers[key] = sampler
+                loaders[key] = DataLoader(
+                    dataset,
+                    batch_size=dataset.batch_size,
+                    num_workers=dataset.num_workers,
+                    pin_memory=True,
+                    shuffle=False,  # sampler controls ordering
+                    sampler=sampler,
+                    prefetch_factor=2,
+                )
+            else:
+                loaders[key] = DataLoader(
+                    dataset,
+                    batch_size=dataset.batch_size,
+                    num_workers=dataset.num_workers,
+                    pin_memory=True,
+                    shuffle=True,
+                    prefetch_factor=2,
+                )
+        return loaders
 
     def val_dataloader(self):
         val_dataloaders = {
@@ -159,3 +204,30 @@ class HulcDataModule(pl.LightningDataModule):
         # combined_val_loaders = val_dataloaders['vis']
         combined_val_loaders = CombinedLoader(val_dataloaders, "max_size_cycle")
         return combined_val_loaders
+    def get_normalize(self, modality: str, index=-1):
+        """
+        Get the mean and std used in Normalize transform for a given modality.
+
+        Args:
+            modality: Modality name.
+        """
+        comp = self.train_transforms[modality]
+        normals = [t for t in comp.transforms if isinstance(t, torchvision.transforms.Normalize)]
+        normal = normals[index]
+        mean_t = torch.tensor(normal.mean) if not isinstance(normal.mean, torch.Tensor) else normal.mean
+        std_t = torch.tensor(normal.std) if not isinstance(normal.std, torch.Tensor) else normal.std
+        return mean_t, std_t
+
+    def get_normalize_val(self, modality: str, index=-1):
+        """
+        Get the mean and std used in Normalize transform for a given modality.
+
+        Args:
+            modality: Modality name.
+        """
+        comp = self.val_transforms[modality]
+        normals = [t for t in comp.transforms if isinstance(t, torchvision.transforms.Normalize)]
+        normal = normals[index]
+        mean_t = torch.tensor(normal.mean) if not isinstance(normal.mean, torch.Tensor) else normal.mean
+        std_t = torch.tensor(normal.std) if not isinstance(normal.std, torch.Tensor) else normal.std
+        return mean_t, std_t

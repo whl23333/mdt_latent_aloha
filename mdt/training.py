@@ -62,6 +62,17 @@ def train(cfg: DictConfig) -> None:
     lr_logger = LearningRateMonitor(logging_interval="step")
     callbacks.append(lr_logger)
 
+    # Ensure custom samplers get epoch reseeding in DDP
+    class _SamplerEpochSetter(Callback):
+        def on_train_epoch_start(self, trainer, pl_module):
+            dm = trainer.datamodule
+            if hasattr(dm, "train_samplers"):
+                for s in dm.train_samplers.values():
+                    if hasattr(s, "set_epoch"):
+                        s.set_epoch(trainer.current_epoch)
+
+    callbacks.append(_SamplerEpochSetter())
+
     trainer_args = {
         **cfg.trainer,
         "logger": train_logger,
@@ -73,6 +84,8 @@ def train(cfg: DictConfig) -> None:
     # Configure multi-GPU training
     if is_multi_gpu_training(trainer_args["gpus"]):  # type: ignore
         trainer_args["strategy"] = "ddp"
+        # Don't let PL replace our custom samplers
+        trainer_args["replace_sampler_ddp"] = False
         if not cfg.slurm:
             modify_argv_hydra()
 
@@ -172,13 +185,6 @@ def log_rank_0(*args, **kwargs):
 
 
 if __name__ == "__main__":
-    # os.environ["PL_TORCH_DISTRIBUTED_BACKEND"] = "gloo"
-    # Set CUDA device IDs
-
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4"
-    print(torch.cuda.is_available())
-    print(torch.cuda.device_count())
+    # Prefer letting Hydra/PL control accelerator/devices; avoid forcing CUDA env here.
     os.environ["TOKENIZERS_PARALLELISM"] = 'True'
     train()

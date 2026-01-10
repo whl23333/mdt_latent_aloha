@@ -89,12 +89,35 @@ def save_executed_code() -> None:
 
 
 def info_cuda() -> Dict[str, Union[str, List[str]]]:
-    return {
-        "GPU": [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
-        # 'nvidia_driver': get_nvidia_driver_version(run_lambda),
-        "available": str(torch.cuda.is_available()),
+    details: Dict[str, Union[str, List[str]]] = {
         "version": torch.version.cuda,
+        "available": "unknown",
+        "GPU": [],
     }
+    # Avoid eager CUDA initialization. Collect info defensively.
+    try:
+        # `is_available()` may initialize CUDA on some setups; guard it.
+        avail = torch.cuda.is_available()
+        details["available"] = str(avail)
+        if avail:
+            try:
+                count = torch.cuda.device_count()
+                gpus = []
+                for i in range(count):
+                    try:
+                        gpus.append(torch.cuda.get_device_name(i))
+                    except Exception as e:
+                        gpus.append(f"error: {type(e).__name__}: {e}")
+                details["GPU"] = gpus
+            except Exception as e:
+                details["GPU"] = [f"error: {type(e).__name__}: {e}"]
+        else:
+            details["GPU"] = []
+    except Exception as e:
+        # Do not crash if CUDA init fails; report the error string instead.
+        details["available"] = f"error: {type(e).__name__}: {e}"
+        details["GPU"] = ["skipped due to CUDA init error"]
+    return details
 
 
 def info_packages() -> Dict[str, str]:

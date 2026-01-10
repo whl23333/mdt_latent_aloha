@@ -9,8 +9,7 @@ from mdt.models.networks.clip import build_model, load_clip, tokenize
 class LangClip(nn.Module):
     def __init__(self, freeze_backbone: bool = True, model_name: str = "RN50"):
         super(LangClip, self).__init__()
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        # Load CLIP model
+        # Load CLIP model on CPU first to avoid eager CUDA init; PL will move module later
         print(f"loading language CLIP model with backbone: {model_name}")
         self._load_clip(model_name)
         if freeze_backbone:
@@ -18,11 +17,14 @@ class LangClip(nn.Module):
                 param.requires_grad = False
 
     def _load_clip(self, model_name: str) -> None:
-        model, _ = load_clip(model_name, device=self.device)
-        self.clip_rn50 = build_model(model.state_dict()).to(self.device)
+        # Build on CPU; Lightning will place on the correct device later
+        model, _ = load_clip(model_name, device=torch.device('cpu'))
+        self.clip_rn50 = build_model(model.state_dict())
 
     def forward(self, x: List) -> torch.Tensor:
+        # Use current module device determined by PL
+        dev = next(self.clip_rn50.parameters()).device
         with torch.no_grad():
-            tokens = tokenize(x).to(self.device)
+            tokens = tokenize(x).to(dev)
             emb = self.clip_rn50.encode_text(tokens)
         return torch.unsqueeze(emb, 1)

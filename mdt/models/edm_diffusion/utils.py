@@ -44,7 +44,8 @@ class FourierFeatures(nn.Module):
         if len(input.shape) == 1:
             input = einops.rearrange(input, 'b -> b 1')
         f = 2 * math.pi * input @ self.weight.T
-        return torch.cat([f.cos(), f.sin()], dim=-1).to(self.device)
+        # Keep outputs on the same device as `input`; Lightning handles module placement.
+        return torch.cat([f.cos(), f.sin()], dim=-1)
 
 
 class GaussianFourierEmbedding(nn.Module):
@@ -57,7 +58,7 @@ class GaussianFourierEmbedding(nn.Module):
             nn.Linear(time_embed_dim, 2*time_embed_dim),
             nn.Mish(),
             nn.Linear(2*time_embed_dim, time_embed_dim)
-        ).to(device)
+        )
     
     def forward(self, t):
         return self.embed(t)
@@ -73,7 +74,7 @@ class SinusoidalPosEmbedding(nn.Module):
             nn.Linear(time_embed_dim, time_embed_dim * 2),
             nn.Mish(),
             nn.Linear(time_embed_dim * 2, time_embed_dim),
-        ).to(self.device)
+        )
     
     def forward(self, t):
         return self.embed(t)

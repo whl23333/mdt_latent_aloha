@@ -96,14 +96,14 @@ class MDTVAgent(pl.LightningModule):
             num_latents=num_latents,
         )
         self.act_window_size = act_window_size
-        self.gen_img = hydra.utils.instantiate(img_gen).to(self.device)
+        self.gen_img = hydra.utils.instantiate(img_gen)
         self.seed = seed
         self.use_lr_scheduler = use_lr_scheduler
         # goal encoders
-        self.visual_goal = hydra.utils.instantiate(visual_goal).to(self.device)
+        self.visual_goal = hydra.utils.instantiate(visual_goal)
         self.language_goal = hydra.utils.instantiate(language_goal) if language_goal else None
         # policy network
-        self.model = hydra.utils.instantiate(model).to(self.device)
+        self.model = hydra.utils.instantiate(model)
         self.modality_scope = "vis"
         self.optimizer_config = optimizer
         self.lr_scheduler = lr_scheduler
