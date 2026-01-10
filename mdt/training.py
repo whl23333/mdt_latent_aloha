@@ -84,8 +84,13 @@ def train(cfg: DictConfig) -> None:
     # Configure multi-GPU training
     if is_multi_gpu_training(trainer_args["gpus"]):  # type: ignore
         trainer_args["strategy"] = "ddp"
-        # Don't let PL replace our custom samplers
-        trainer_args["replace_sampler_ddp"] = False
+        # Only disable PL's sampler replacement when a custom sampler is enabled
+        use_custom_sampler = False
+        try:
+            use_custom_sampler = bool(getattr(cfg.datamodule, "use_epoch_sampler", False)) and float(getattr(cfg.datamodule, "sampler_fraction", 1.0)) < 1.0
+        except Exception:
+            use_custom_sampler = False
+        trainer_args["replace_sampler_ddp"] = not use_custom_sampler and trainer_args.get("replace_sampler_ddp", True)
         if not cfg.slurm:
             modify_argv_hydra()
 
