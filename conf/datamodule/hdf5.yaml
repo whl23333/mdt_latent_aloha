@@ -4,7 +4,7 @@
 _target_: mdt.datasets.hdf5_data_module.HDF5DataModule
 
 # Path to your HDF5 dataset (must contain train/ and val/ subdirectories)
-hdf5_dir: /group/ycyang/jfwu/aloha/data/whl
+hdf5_dir: /data/share/aloha_multiview/
 
 # Sequence parameters
 sequence_length: 10  # Number of future steps to predict (T)

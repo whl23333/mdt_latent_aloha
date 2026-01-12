@@ -21,7 +21,7 @@ future_range: 29
 seed: 242
 device: 'cuda'
 batch_size: 64 # 38 # 128
-devices: 1
+devices: 2
 goal_window_size: 1
 act_dim: 7
 obs_dim: 384
@@ -40,7 +40,7 @@ img_gen_frame_diff: 3
 use_extracted_rel_actions: true
 benchmark_name: calvin_abcd # calvin_abcd  
 
-pred_latent_motion_embeddings: True
+pred_latent_motion_embeddings: False
 latent_motion_dim: 32
 per_latent_motion_len: 8
 

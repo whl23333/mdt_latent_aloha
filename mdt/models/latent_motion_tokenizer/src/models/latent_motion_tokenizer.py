@@ -11,7 +11,7 @@ import time
 from collections import OrderedDict
 import os
 import sys
-UNIMATCH_PATH = "/group/ycyang/jfwu/aloha/mdt_policy/mdt/models/"
+UNIMATCH_PATH = "/data/250010208/whl/code/Moto"
 sys.path.insert(0, UNIMATCH_PATH)
 from unimatch.unimatch.unimatch import UniMatch
 from typing import List, Dict, Optional, Tuple, Union, Any

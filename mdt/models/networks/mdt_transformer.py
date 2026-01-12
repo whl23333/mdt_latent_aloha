@@ -179,7 +179,7 @@ class MDTTransformer(nn.Module):
             nn.Linear(embed_dim, embed_dim * 2),
             nn.Mish(),
             nn.Linear(embed_dim * 2, embed_dim),
-        ).to(self.device)
+        )
 
         # Action prediction layers (original)
         self.action_emb = nn.Linear(action_dim, embed_dim)
@@ -210,7 +210,7 @@ class MDTTransformer(nn.Module):
                 nn.Linear(proprio_dim, embed_dim * 2),
                 nn.Mish(),
                 nn.Linear(embed_dim * 2, embed_dim),
-            ).to(self.device)
+            )
 
         self.apply(self._init_weights)
 
@@ -380,7 +380,8 @@ class MDTTransformer(nn.Module):
         if self.training:
             goals = self.mask_cond(goals)
         if uncond:
-            goals = torch.zeros_like(goals).to(self.device)
+            # Keep on the same device as `goals` to avoid forcing a global device index under DDP
+            goals = torch.zeros_like(goals)
         return goals
 
     def process_state_embeddings(self, states):
