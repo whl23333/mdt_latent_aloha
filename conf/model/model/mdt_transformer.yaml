@@ -16,6 +16,7 @@ inner_model:
   goal_seq_len: ${goal_window_size}
   obs_seq_len: ${obs_seq_len}
   action_seq_len: ${act_seq_len}
+  token_seq_len: 16
   embed_pdrob: 0
   goal_drop: 0
   attn_pdrop: 0.3
@@ -32,4 +33,6 @@ inner_model:
   use_noise_encoder: False # only relevant for ada_conditioning
   use_modality_encoder: True
   use_mlp_goal: True
+  token_dim: 32
+  pred_tokens: true
   

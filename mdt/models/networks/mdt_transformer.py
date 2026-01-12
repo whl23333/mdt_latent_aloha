@@ -54,6 +54,8 @@ class MDTTransformer(nn.Module):
         goal_seq_len: int,
         obs_seq_len: int,
         action_seq_len: int,
+        token_dim: Optional[int] = None,
+        token_seq_len: Optional[int] = None,
         proprio_dim: Optional[int] = None,
         goal_drop: float = 0.1,
         bias=False,
@@ -66,6 +68,7 @@ class MDTTransformer(nn.Module):
         latent_is_decoder: bool = False,
         use_modality_encoder: bool = False,
         use_mlp_goal: bool = False,
+        pred_tokens: bool = False,
     ):
         super().__init__()
         self.device = device
@@ -75,18 +78,32 @@ class MDTTransformer(nn.Module):
         self.use_ada_conditioning = use_ada_conditioning
         self.proprio_dim = proprio_dim
         self.latent_is_decoder = latent_is_decoder
-        block_size = goal_seq_len + action_seq_len + obs_seq_len + 1
+        self.pred_tokens = pred_tokens
+        # Support both action and token sequence lengths: use the maximum
+        if self.pred_tokens == False:
+            block_size = goal_seq_len + action_seq_len + obs_seq_len + 1
+        else:
+            assert token_seq_len is not None, "token_seq_len must be provided when pred_tokens is True."
+            assert token_dim is not None, "token_dim must be provided when pred_tokens is True."
+            block_size = goal_seq_len + token_seq_len + obs_seq_len + 1
         self.action_seq_len = action_seq_len
+        self.token_seq_len = token_seq_len
         self.use_modality_encoder = use_modality_encoder
         seq_size = goal_seq_len + action_seq_len
         self.tok_emb = nn.Linear(obs_dim, embed_dim)
         self.incam_embed = nn.Linear(self.obs_dim, self.embed_dim)
-        self.pos_emb = nn.Parameter(torch.zeros(1, seq_size, embed_dim))
+        # Two sets of absolute positional embeddings for actions vs tokens
+        self.pos_emb_actions = nn.Parameter(torch.zeros(1, goal_seq_len + action_seq_len, embed_dim))
+        self.pos_emb_tokens = (
+            nn.Parameter(torch.zeros(1, goal_seq_len + token_seq_len, embed_dim))
+            if token_seq_len is not None else None
+        )
         self.drop = nn.Dropout(embed_pdrob)
         self.cond_mask_prob = goal_drop
         self.use_rot_embed = use_rot_embed
         self.use_abs_pos_emb = use_abs_pos_emb
         self.action_dim = action_dim
+        self.token_dim = token_dim
         self.embed_dim = embed_dim
         self.latent_encoder_emb = None
 
@@ -166,14 +183,23 @@ class MDTTransformer(nn.Module):
         )
 
         self.action_emb = nn.Linear(action_dim, embed_dim)
+        self.token_emb = nn.Linear(token_dim, embed_dim) if token_dim is not None else None
 
         if linear_output:
             self.action_pred = nn.Linear(embed_dim, self.action_dim)
+            self.token_pred = nn.Linear(embed_dim, self.token_dim) if self.token_dim is not None else None
         else:
             self.action_pred = nn.Sequential(
                 nn.Linear(embed_dim, embed_dim),
                 nn.GELU(),
                 nn.Linear(embed_dim, self.action_dim)
+            )
+            self.token_pred = (
+                nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim),
+                    nn.GELU(),
+                    nn.Linear(embed_dim, self.token_dim)
+                ) if self.token_dim is not None else None
             )
 
         if proprio_dim is not None:
@@ -201,22 +227,33 @@ class MDTTransformer(nn.Module):
             torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight)
         elif isinstance(module, MDTTransformer):
-            torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
+            if hasattr(module, 'pos_emb_actions') and module.pos_emb_actions is not None:
+                torch.nn.init.normal_(module.pos_emb_actions, mean=0.0, std=0.02)
+            if hasattr(module, 'pos_emb_tokens') and module.pos_emb_tokens is not None:
+                torch.nn.init.normal_(module.pos_emb_tokens, mean=0.0, std=0.02)
 
-    def forward(self, states, actions, goals, sigma, uncond: Optional[bool] = False):
-        context = self.enc_only_forward(states, actions, goals, sigma, uncond)
-        pred_actions = self.dec_only_forward(context, actions, sigma)
-        return pred_actions
+    def forward(self, states, actions, goals, sigma, uncond: Optional[bool] = False, mode: str = 'actions'):
+        context = self.enc_only_forward(states, actions, goals, sigma, uncond, mode=mode)
+        preds = self.dec_only_forward(context, actions, sigma, mode=mode)
+        return preds
 
-    def enc_only_forward(self, states, actions, goals, sigma, uncond: Optional[bool] = False):
+    def enc_only_forward(self, states, actions, goals, sigma, uncond: Optional[bool] = False, mode: str = 'actions'):
         emb_t = self.process_sigma_embeddings(sigma) if not self.use_ada_conditioning else None
         goals = self.preprocess_goals(goals, 1, uncond)
         state_embed, proprio_states = self.process_state_embeddings(states)
         goal_embed = self.goal_emb(goals)
-        action_embed = self.action_emb(actions)
+        if mode == 'actions':
+            assert self.pred_tokens == False, "pred_tokens must be False when mode is 'actions'"
+            action_embed = self.action_emb(actions)
+        elif mode == 'tokens':
+            assert self.pred_tokens == True, "pred_tokens must be True when mode is 'tokens'"
+            assert self.token_emb is not None, "token_emb is not initialized; provide token_dim in config."
+            action_embed = self.token_emb(actions)
+        else:
+            raise ValueError(f"Unknown mode {mode}")
 
         if self.use_abs_pos_emb:
-            goal_x, state_x, action_x, proprio_x = self.apply_position_embeddings(goal_embed, state_embed, action_embed, proprio_states, 1)
+            goal_x, state_x, action_x, proprio_x = self.apply_position_embeddings(goal_embed, state_embed, action_embed, proprio_states, 1, mode=mode)
         else:
             goal_x = self.drop(goal_embed)
             state_x = self.drop(state_embed)
@@ -228,9 +265,17 @@ class MDTTransformer(nn.Module):
         self.latent_encoder_emb = context
         return context
 
-    def dec_only_forward(self, context, actions, sigma):
+    def dec_only_forward(self, context, actions, sigma, mode: str = 'actions'):
         emb_t = self.process_sigma_embeddings(sigma)
-        action_embed = self.action_emb(actions)
+        if mode == 'actions':
+            assert self.pred_tokens == False, "pred_tokens must be False when mode is 'actions'"
+            action_embed = self.action_emb(actions)
+        elif mode == 'tokens':
+            assert self.pred_tokens == True, "pred_tokens must be True when mode is 'tokens'"
+            assert self.token_emb is not None, "token_emb is not initialized; provide token_dim in config."
+            action_embed = self.token_emb(actions)
+        else:
+            raise ValueError(f"Unknown mode {mode}")
         action_x = self.drop(action_embed)
 
         if self.use_ada_conditioning:
@@ -238,8 +283,12 @@ class MDTTransformer(nn.Module):
         else:
             x = self.decoder(action_x, context)
 
-        pred_actions = self.action_pred(x)
-        return pred_actions
+        if mode == 'actions':
+            preds = self.action_pred(x)
+        else:
+            assert self.token_pred is not None, "token_pred is not initialized; provide token_dim in config."
+            preds = self.token_pred(x)
+        return preds
     
     def mask_cond(self, cond, force_mask=False):
         bs, t, d = cond.shape
@@ -254,7 +303,7 @@ class MDTTransformer(nn.Module):
     def get_params(self):
         return self.parameters()
 
-    def forward_enc_only(self, states, actions, goals, sigma, uncond: Optional[bool] = False):
+    def forward_enc_only(self, states, actions, goals, sigma, uncond: Optional[bool] = False, mode: str = 'actions'):
         b, t, dim = states['static'].size()
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
 
@@ -262,10 +311,16 @@ class MDTTransformer(nn.Module):
         goals = self.preprocess_goals(goals, t, uncond)
         state_embed, proprio_states = self.process_state_embeddings(states)
         goal_embed = self.process_goal_embeddings(goals, states)
-        action_embed = self.action_emb(actions)
+        if mode == 'actions':
+            action_embed = self.action_emb(actions)
+        elif mode == 'tokens':
+            assert self.token_emb is not None, "token_emb is not initialized; provide token_dim in config."
+            action_embed = self.token_emb(actions)
+        else:
+            raise ValueError(f"Unknown mode {mode}")
 
         if self.use_abs_pos_emb:
-            goal_x, state_x, action_x, proprio_x = self.apply_position_embeddings(goal_embed, state_embed, action_embed, proprio_states, t)
+            goal_x, state_x, action_x, proprio_x = self.apply_position_embeddings(goal_embed, state_embed, action_embed, proprio_states, t, mode=mode)
         else:
             goal_x = self.drop(goal_embed)
             state_x = self.drop(state_embed)
@@ -315,8 +370,12 @@ class MDTTransformer(nn.Module):
         proprio_states = None
         return state_embed, proprio_states
 
-    def apply_position_embeddings(self, goal_embed, state_embed, action_embed, proprio_states, t):
-        position_embeddings = self.pos_emb
+    def apply_position_embeddings(self, goal_embed, state_embed, action_embed, proprio_states, t, mode: str = 'actions'):
+        if mode == 'actions':
+            assert self.pred_tokens == False, "pred_tokens must be False when mode is 'actions'"
+        else:
+            assert self.pred_tokens == True, "pred_tokens must be True when mode is 'tokens'"
+        position_embeddings = self.pos_emb_actions if mode == 'actions' else self.pos_emb_tokens
         goal_x = self.drop(goal_embed + position_embeddings[:, :self.goal_seq_len, :])
         state_x = self.drop(state_embed + position_embeddings[:, self.goal_seq_len:(self.goal_seq_len + t), :])
         action_x = self.drop(action_embed + position_embeddings[:, 1:, :])

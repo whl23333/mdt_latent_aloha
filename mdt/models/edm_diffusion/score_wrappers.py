@@ -58,6 +58,7 @@ class GCDenoiser(nn.Module):
         """
         c_skip, c_out, c_in = [append_dims(x, action.ndim) for x in self.get_scalings(sigma)]
         noised_input = action + noise * append_dims(sigma, action.ndim)
+        # Pass through to inner model; kwargs can include mode='actions'|'tokens'
         model_output = self.inner_model(state, noised_input * c_in, goal, sigma, **kwargs)
         target = (action - c_skip * noised_input) / c_out
         return (model_output - target).pow(2).flatten(1).mean(), model_output

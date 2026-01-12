@@ -23,6 +23,9 @@ from mdt.models.perceptual_encoders.no_encoder import NoEncoder
 from mdt.models.networks.transformers.transformer_blocks import ClipStyleProjection
 from mdt.callbacks.ema import EMA
 from mdt.models.perceptual_encoders.resnets import BesoResNetEncoder
+import os
+import sys
+sys.path.append("/data/250010208/whl/code/Moto")
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +69,10 @@ class MDTAgent(pl.LightningModule):
         masked_beta: float = 1,
         use_distributed_clip: bool = False,
         use_text_not_embedding: bool = False,
+        predict_embeddings: bool = False,
+        latent_motion_tokenizer: Optional[DictConfig] = None,
+        latent_motion_tokenizer_ckpt: Optional[str] = None,
+        latent_action_num: int = 2,
         ckpt_path=None,
         seed: int = 42,
     ):
@@ -104,6 +111,9 @@ class MDTAgent(pl.LightningModule):
         self.state_recons = False
         self.cont_alpha = cont_alpha
         self.use_text_not_embedding = use_text_not_embedding
+        self.predict_embeddings = predict_embeddings
+        self.latent_action_num = latent_action_num
+        assert self.predict_embeddings == self.model.inner_model.pred_tokens, "predict_embeddings and model.inner_model.pred_tokens must match."
         # print_model_parameters(self.perceptual_encoder.perceiver_resampler)
         # for clip loss ground truth plot
         self.cont_loss = self.clip_auxiliary_loss
@@ -118,6 +128,28 @@ class MDTAgent(pl.LightningModule):
         self.clip_loss_type = 'symmetric'
         self.logit_scale = torch.nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.ema_callback_idx = None
+
+        # Optional latent motion tokenizer for embedding targets
+        self.lmt = None
+        if self.predict_embeddings:
+            assert latent_motion_tokenizer is not None, "latent_motion_tokenizer must be provided when predict_embeddings is True."
+            # Support passing a DictConfig or a path-like string
+            if isinstance(latent_motion_tokenizer, DictConfig):
+                self.lmt = hydra.utils.instantiate(latent_motion_tokenizer)
+            elif isinstance(latent_motion_tokenizer, (str, os.PathLike)):
+                cfg = OmegaConf.load(str(latent_motion_tokenizer))
+                self.lmt = hydra.utils.instantiate(cfg)
+            else:
+                raise ValueError("latent_motion_tokenizer must be a DictConfig or path to config.yaml")
+            # Freeze params and set eval mode
+            self.lmt.requires_grad_(False)
+            self.lmt.eval()
+            if latent_motion_tokenizer_ckpt is not None:
+                checkpoint = torch.load(latent_motion_tokenizer_ckpt, map_location='cpu')
+                self.lmt.load_state_dict(checkpoint['state_dict'])
+                print(f"Loaded latent motion tokenizer from {latent_motion_tokenizer_ckpt}")
+            else:
+                print("Warning: latent_motion_tokenizer_ckpt is None, using randomly initialized weights.")
         if ckpt_path is not None:
             self.load_pretrained_parameters(ckpt_path)
 
@@ -228,7 +260,16 @@ class MDTAgent(pl.LightningModule):
             # Compute the required embeddings
             perceptual_emb, latent_goal, image_latent_goal = self.compute_input_embeddings(dataset_batch)
 
-            act_loss, sigmas, noise = self.diffusion_loss(
+            if self.predict_embeddings:
+                # Build embedding targets via tokenizer (no grad)
+                emb_targets = self.compute_embedding_targets(dataset_batch)
+                pred_loss, sigmas, noise = self.diffusion_loss(
+                    perceptual_emb,
+                    latent_goal,
+                    emb_targets,
+                )
+            else:
+                pred_loss, sigmas, noise = self.diffusion_loss(
                     perceptual_emb,
                     latent_goal,
                     dataset_batch["actions"],
@@ -260,8 +301,8 @@ class MDTAgent(pl.LightningModule):
             cont_loss += self.cont_alpha * cont_loss_part
             total_loss += self.cont_alpha * cont_loss_part
 
-            action_loss += act_loss
-            total_loss += act_loss
+            action_loss += pred_loss
+            total_loss += pred_loss
             
             batch_size[self.modality_scope] = dataset_batch["actions"].shape[0]
             total_bs += dataset_batch["actions"].shape[0]
@@ -298,15 +339,26 @@ class MDTAgent(pl.LightningModule):
             # Compute the required embeddings
             perceptual_emb, latent_goal, image_latent_goal = self.compute_input_embeddings(dataset_batch)
 
-            # predict the next action sequence
-            action_pred = self.denoise_actions(
-                torch.zeros_like(latent_goal).to(latent_goal.device),
-                perceptual_emb,
-                latent_goal,
-                inference=True,
-            )
-            # compute the mse action loss
-            pred_loss = torch.nn.functional.mse_loss(action_pred, dataset_batch["actions"])
+            if self.predict_embeddings:
+                emb_targets = self.compute_embedding_targets(dataset_batch)
+                emb_pred = self.denoise_embeddings(
+                    torch.zeros_like(latent_goal).to(latent_goal.device),
+                    perceptual_emb,
+                    latent_goal,
+                    target_shape=emb_targets.shape,
+                    inference=True,
+                )
+                pred_loss = torch.nn.functional.mse_loss(emb_pred, emb_targets)
+            else:
+                # predict the next action sequence
+                action_pred = self.denoise_actions(
+                    torch.zeros_like(latent_goal).to(latent_goal.device),
+                    perceptual_emb,
+                    latent_goal,
+                    inference=True,
+                )
+                # compute the mse action loss
+                pred_loss = torch.nn.functional.mse_loss(action_pred, dataset_batch["actions"])
             latent_encoder_emb = self.model.inner_model.latent_encoder_emb
             val_total_act_loss_pp += pred_loss
             
@@ -418,6 +470,35 @@ class MDTAgent(pl.LightningModule):
                 
         return img_gen_loss     
 
+    @torch.no_grad()
+    def compute_embedding_targets(self, dataset_batch: Dict[str, Any]) -> torch.Tensor:
+        """
+        Build codebook embeddings from tokenizer indices using two-frame inputs per view.
+        Expects rgb_obs['rgb_static'] and rgb_obs['rgb_gripper'] with shape [B, 2, 3, H, W].
+        Returns embeddings of shape [B, per_len, codebook_dim].
+        """
+        assert self.lmt is not None, "Latent motion tokenizer is not initialized."
+        latent_action_diff = dataset_batch['latent_action_diff'][0]
+        latent_action_num = dataset_batch['latent_action_num'][0]
+        assert latent_action_num == self.latent_action_num, f"latent_action_num in dataset ({latent_action_num}) does not match the initialized value ({self.latent_action_num})."
+        latent_static = dataset_batch['latent_static']   # (B, T, C, H, W) 
+        latent_gripper = dataset_batch["latent_gripper"]  # (B, T, C, H, W) 
+        assert latent_static.shape[1] == latent_gripper.shape[1] and latent_static.shape[1] == latent_action_num + 1, "latent_static, latent_gripper T should be action_num + 1"
+        assert (latent_action_diff * latent_action_num == self.model.inner_model.token_seq_len), f"latent_action_diff * latent_action_num ({latent_action_diff * latent_action_num}) does not match model token_seq_len ({self.model.inner_model.token_seq_len})"
+        B, T, C, H, W = latent_static.shape
+
+        indices = self.lmt(
+            cond_pixel_values1=latent_static[:, :-1].reshape(-1, C, H, W),
+            target_pixel_values1=latent_static[:, 1:].reshape(-1, C, H, W),
+            cond_pixel_values2=latent_gripper[:, :-1].reshape(-1, C, H, W),
+            target_pixel_values2=latent_gripper[:, 1:].reshape(-1, C, H, W),
+            return_motion_token_ids_only=True,
+        ).reshape(B, latent_action_num * latent_action_diff)
+        # Convert indices -> embeddings via codebook
+        embeddings = self.lmt.vector_quantizer.get_codebook_entry(indices)
+        # No pad/truncate here; model handles positional alignment via dual embeddings
+        return embeddings
+
     def compute_contrastive_loss(self, perceptual_emb, latent_goal, image_latent_goal, dataset_batch, sigma,  noise):
         """
         Compute the contrastive loss based on the provided embeddings and dataset batch.
@@ -490,15 +571,16 @@ class MDTAgent(pl.LightningModule):
         self,
         perceptual_emb: torch.Tensor,
         latent_goal: torch.Tensor,
-        actions: torch.Tensor,
+        target: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Computes the score matching loss given the perceptual embedding, latent goal, and desired actions.
+        Computes the score matching loss given the perceptual embedding, latent goal, and desired target.
         """
         self.model.train()
-        sigmas = self.make_sample_density()(shape=(len(actions),), device=self.device).to(self.device)
-        noise = torch.randn_like(actions).to(self.device)
-        loss, _ = self.model.loss(perceptual_emb, actions, latent_goal, noise, sigmas)
+        sigmas = self.make_sample_density()(shape=(len(target),), device=self.device).to(self.device)
+        noise = torch.randn_like(target).to(self.device)
+        mode = 'tokens' if self.predict_embeddings else 'actions'
+        loss, _ = self.model.loss(perceptual_emb, target, latent_goal, noise, sigmas, mode=mode)
         return loss, sigmas, noise
     
     def denoise_actions(  # type: ignore
@@ -529,6 +611,34 @@ class MDTAgent(pl.LightningModule):
         actions = self.sample_loop(sigmas, x, input_state, latent_goal, latent_plan, self.sampler_type, extra_args)
 
         return actions
+
+    def denoise_embeddings(  # type: ignore
+        self,
+        latent_plan: torch.Tensor,
+        perceptual_emb: torch.Tensor,
+        latent_goal: torch.Tensor,
+        target_shape: torch.Size,
+        inference: Optional[bool] = False,
+        extra_args={}
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Denoise the next sequence of embedding tokens with shape [B, per_len, codebook_dim].
+        """
+        if inference:
+            sampling_steps = self.num_sampling_steps
+        else:
+            sampling_steps = 10
+        self.model.eval()
+        if len(latent_goal.shape) < len(perceptual_emb['static'].shape if isinstance(perceptual_emb, dict) else perceptual_emb.shape): 
+            latent_goal = latent_goal.unsqueeze(1)
+        input_state = perceptual_emb
+        sigmas = self.get_noise_schedule(sampling_steps, self.noise_scheduler)
+        if len(latent_goal.shape) == 2:
+            goal = einops.rearrange(latent_goal, 'b d -> 1 b d')
+
+        x = torch.randn(target_shape, device=self.device) * self.sigma_max
+        tokens = self.sample_loop(sigmas, x, input_state, latent_goal, latent_plan, self.sampler_type, extra_args)
+        return tokens
 
     def make_sample_density(self):
         """ 
@@ -592,6 +702,8 @@ class MDTAgent(pl.LightningModule):
             reduced_args = {x:extra_args[x] for x in keys}
         else:
             reduced_args = {}
+        # Pass output mode to the model for selecting proper head
+        reduced_args['mode'] = 'tokens' if self.predict_embeddings else 'actions'
         if use_scaler:
             scaler = self.scaler
         else:
@@ -736,6 +848,8 @@ class MDTAgent(pl.LightningModule):
         self.language_goal.to(dtype=self.dtype)
         self.visual_goal.to(dtype=self.dtype)
         self.gen_img.to(dtype=self.dtype)
+        if self.lmt is not None:
+            self.lmt.eval()
         
         for idx, callback in enumerate(self.trainer.callbacks):
             if isinstance(callback, EMA):
@@ -805,3 +919,8 @@ class MDTAgent(pl.LightningModule):
 def log_rank_0(*args, **kwargs):
     # when using ddp, only log with rank 0 process
     logger.info(*args, **kwargs)
+
+    
+    
+    
+    

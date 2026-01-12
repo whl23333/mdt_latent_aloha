@@ -1,5 +1,5 @@
 lang_dataset: 
-  _target_: mdt.datasets.disk_dataset.ExtendedDiskDataset
+  _target_: mdt.datasets.disk_dataset.ExtendedDiskDatasetLatent
   key: "lang"
   save_format: "npz"
   batch_size: ${batch_size}
@@ -21,8 +21,11 @@ lang_dataset:
   img_gen_frame_diff: ${img_gen_frame_diff}
   use_extracted_rel_actions: ${use_extracted_rel_actions}
 
+  latent_action_num: 2
+  latent_action_diff: 5
+
 vision_dataset:
-  _target_: mdt.datasets.disk_dataset.ExtendedDiskDataset
+  _target_: mdt.datasets.disk_dataset.ExtendedDiskDatasetLatent
   key: "vis"
   save_format: "npz"
   batch_size: ${batch_size}
@@ -41,3 +44,6 @@ vision_dataset:
 
   img_gen_frame_diff: ${img_gen_frame_diff}
   use_extracted_rel_actions: ${use_extracted_rel_actions}
+
+  latent_action_num: 2
+  latent_action_diff: 5
