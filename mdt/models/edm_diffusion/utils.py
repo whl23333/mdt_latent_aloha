@@ -35,46 +35,48 @@ class GaussianFourierProjection(nn.Module):
 class FourierFeatures(nn.Module):
     def __init__(self, time_embed_dim, device, in_features=1,  std=1.):
         super().__init__()
-        self.device = device
+        # Avoid forcing device at init; Lightning will move buffers with the module
         assert time_embed_dim % 2 == 0
-        self.register_buffer('weight', torch.randn([time_embed_dim // 2, in_features]) * std
-                             )
+        self.register_buffer('weight', torch.randn([time_embed_dim // 2, in_features]) * std)
 
     def forward(self, input):
         if len(input.shape) == 1:
             input = einops.rearrange(input, 'b -> b 1')
-        f = 2 * math.pi * input @ self.weight.T
-        return torch.cat([f.cos(), f.sin()], dim=-1).to(self.device)
+        # ensure buffer is on same device as input without globally forcing device ids
+        w = self.weight
+        if w.device != input.device:
+            w = w.to(input.device)
+        f = 2 * math.pi * input @ w.T
+        return torch.cat([f.cos(), f.sin()], dim=-1)
 
 
 class GaussianFourierEmbedding(nn.Module):
-    
     def __init__(self, time_embed_dim, device):
         super().__init__()
-        self.t_dim = time_embed_dim 
+        self.t_dim = time_embed_dim
+        # Do not move to a specific device here; rely on module placement by Lightning
         self.embed = nn.Sequential(
             GaussianFourierProjection(embed_dim=time_embed_dim),
-            nn.Linear(time_embed_dim, 2*time_embed_dim),
+            nn.Linear(time_embed_dim, 2 * time_embed_dim),
             nn.Mish(),
-            nn.Linear(2*time_embed_dim, time_embed_dim)
-        ).to(device)
-    
+            nn.Linear(2 * time_embed_dim, time_embed_dim),
+        )
+
     def forward(self, t):
         return self.embed(t)
 
 
 class SinusoidalPosEmbedding(nn.Module):
-    
     def __init__(self, time_embed_dim, device):
         super().__init__()
-        self.device = device
+        # Avoid device placement here; module will be moved by Lightning
         self.embed = nn.Sequential(
             SinusoidalPosEmb(time_embed_dim),
             nn.Linear(time_embed_dim, time_embed_dim * 2),
             nn.Mish(),
             nn.Linear(time_embed_dim * 2, time_embed_dim),
-        ).to(self.device)
-    
+        )
+
     def forward(self, t):
         return self.embed(t)
     

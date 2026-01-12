@@ -36,6 +36,6 @@ gen_frame_source: "last"  # Options: 'last', 'middle', or integer index
 # Modalities to use
 modalities: ["vis", "lang"]  # Options: ["vis"], ["lang"], or ["vis", "lang"]
 # transforms_config_path
-transforms_config_path: '/group/ycyang/jfwu/aloha/mdt_policy/conf/datamodule/transforms/aloha_transforms.yaml'
+transforms_config_path: '/data/250010208/whl/code/mdt_new/mdt_latent_aloha/conf/datamodule/transforms/aloha_transforms.yaml'
 latent_motion_tokenizer_cfg_path: '/group/ycyang/jfwu/aloha/mdt_policy/mdt/models/latent_motion_tokenizer/configs/models/model__3d_simple_sngl_dcdr.yaml'
 latent_motion_tokenizer_ckpt_path: null

@@ -49,15 +49,16 @@ class HulcWrapper(gym.Wrapper):
         rgb_obs = process_rgb(obs["rgb_obs"], self.observation_space_keys, self.transforms, device=self.device)
         depth_obs = process_depth(obs["depth_obs"], self.observation_space_keys, self.transforms)
 
-        state_obs["robot_obs"] = state_obs["robot_obs"].to(self.device).unsqueeze(0)
-        rgb_obs.update({"rgb_obs": {k: v.to(self.device).unsqueeze(0) for k, v in rgb_obs["rgb_obs"].items()}})
-        depth_obs.update({"depth_obs": {k: v.to(self.device).unsqueeze(0) for k, v in depth_obs["depth_obs"].items()}})
+        # Keep tensors on CPU here; Lightning will move them to the correct device per process
+        state_obs["robot_obs"] = state_obs["robot_obs"].unsqueeze(0)
+        rgb_obs.update({"rgb_obs": {k: v.unsqueeze(0) for k, v in rgb_obs["rgb_obs"].items()}})
+        depth_obs.update({"depth_obs": {k: v.unsqueeze(0) for k, v in depth_obs["depth_obs"].items()}})
 
         obs_dict: Dict = {
             **rgb_obs,
             **state_obs,
             **depth_obs,
-            "robot_obs_raw": torch.from_numpy(obs["robot_obs"]).to(self.device),
+            "robot_obs_raw": torch.from_numpy(obs["robot_obs"]),
         }
         return obs_dict
 

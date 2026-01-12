@@ -192,6 +192,7 @@ class HDF5DataModule(pl.LightningDataModule):
                 shuffle=True,
                 collate_fn=mdt_collate_fn,
                 prefetch_factor=2,
+                persistent_workers=True,
             )
             for key, dataset in self.train_datasets.items()
         }

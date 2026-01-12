@@ -53,6 +53,10 @@ class HDF5Dataset_for_MotoGPT_CALVINLike(Dataset):
         self.camera_gripper_key = camera_gripper_key
         self.camera_left_key = camera_left_key
 
+        # cache of open h5py.File handles (per-process / per-worker)
+        # key: file path, value: h5py.File object opened in read-only mode
+        self._file_cache = {}
+
         # preallocate dummies (match CALVIN output types and shapes)
         self.dummy_rgb_initial = torch.zeros(1, 3, rgb_shape[0], rgb_shape[1], dtype=torch.uint8)
         self.dummy_rgb_future = torch.zeros(sequence_length, 3, rgb_shape[0], rgb_shape[1], dtype=torch.uint8)
@@ -208,6 +212,22 @@ class HDF5Dataset_for_MotoGPT_CALVINLike(Dataset):
         act = np.asarray(qpos[-7:], dtype=np.float32)
         return torch.from_numpy(act)
 
+    def _get_file(self, file_path):
+        """Get (and cache) an open h5py.File handle for the given path.
+
+        This avoids repeatedly opening/closing the same HDF5 file for every
+        sample, which can be a significant overhead when episodes are small
+        and accessed many times per epoch. The cache is per Dataset instance
+        and thus per DataLoader worker process.
+        """
+        f = self._file_cache.get(file_path, None)
+        # h5py File objects have an "id" attribute; when the file is closed,
+        # "id" evaluates to False. We reopen if missing or already closed.
+        if f is None or not f.id:
+            f = h5py.File(file_path, "r")
+            self._file_cache[file_path] = f
+        return f
+
     def _map_global_to_episode(self, global_idx):
         # binary search on cumulative to find episode index
         ep_idx = bisect.bisect_right(self.cumulative, global_idx)
@@ -253,33 +273,34 @@ class HDF5Dataset_for_MotoGPT_CALVINLike(Dataset):
 
                 # lang paired from instr.txt per episode when available; otherwise empty
 
-                # open file once per sample and reuse
-                with h5py.File(file_path, "r") as f:
-                    # initial frame
-                    rgb_initial[0] = self._read_frame_f(f, start_local_step)
-                    rgb_initial_gripper[0] = self._read_frame_gripper_f(f, start_local_step)
-                    rgb_initial_left[0] = self._read_frame_left_f(f, start_local_step)
+                # get (and cache) an open file handle for this episode
+                f = self._get_file(file_path)
 
-                    # future frames
-                    if self.do_extract_future_frames:
-                        for i in range(self.sequence_length):
-                            next_idx = start_local_step + (i + 1) * delta_t
-                            if next_idx < num_frames:
-                                rgb_future[i] = self._read_frame_f(f, next_idx)
-                                rgb_future_gripper[i] = self._read_frame_gripper_f(f, next_idx)
-                                rgb_future_left[i] = self._read_frame_left_f(f, next_idx)
-                                latent_mask[i] = 1
-                            else:
-                                break
+                # initial frame
+                rgb_initial[0] = self._read_frame_f(f, start_local_step)
+                rgb_initial_gripper[0] = self._read_frame_gripper_f(f, start_local_step)
+                rgb_initial_left[0] = self._read_frame_left_f(f, start_local_step)
 
-                    # actions (from qpos last 7 dims)
-                    if self.do_extract_action:
-                        for i in range(self.sequence_length):
-                            for j in range(self.chunk_size):
-                                cur_idx = start_local_step + i * delta_t + j
-                                if cur_idx < num_frames:
-                                    mask[i, j] = 1
-                                    actions[i, j] = self._read_qpos_f(f, cur_idx)
+                # future frames
+                if self.do_extract_future_frames:
+                    for i in range(self.sequence_length):
+                        next_idx = start_local_step + (i + 1) * delta_t
+                        if next_idx < num_frames:
+                            rgb_future[i] = self._read_frame_f(f, next_idx)
+                            rgb_future_gripper[i] = self._read_frame_gripper_f(f, next_idx)
+                            rgb_future_left[i] = self._read_frame_left_f(f, next_idx)
+                            latent_mask[i] = 1
+                        else:
+                            break
+
+                # actions (from qpos last 7 dims)
+                if self.do_extract_action:
+                    for i in range(self.sequence_length):
+                        for j in range(self.chunk_size):
+                            cur_idx = start_local_step + i * delta_t + j
+                            if cur_idx < num_frames:
+                                mask[i, j] = 1
+                                actions[i, j] = self._read_qpos_f(f, cur_idx)
 
                 if not self.no_repeat_data:
                     if self.do_extract_future_frames and (not self.do_extract_action) and latent_mask.sum() == 0:
@@ -314,3 +335,14 @@ class HDF5Dataset_for_MotoGPT_CALVINLike(Dataset):
 
         # if we reach here, give up to avoid hanging
         raise RuntimeError(f"Failed to fetch sample after {self.max_attempts} attempts.")
+
+    def __del__(self):
+        # best-effort cleanup of cached file handles
+        file_cache = getattr(self, "_file_cache", None)
+        if not file_cache:
+            return
+        for f in file_cache.values():
+            try:
+                f.close()
+            except Exception:
+                pass
