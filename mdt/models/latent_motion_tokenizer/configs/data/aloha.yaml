@@ -1,0 +1,3 @@
+hdf5_dir: "/media/disk3/WHL/aloha/"
+rgb_shape: [480, 640]
+skip_frame: 20

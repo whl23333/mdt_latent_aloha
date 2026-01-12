@@ -66,6 +66,10 @@ class MDTTransformer(nn.Module):
         latent_is_decoder: bool = False,
         use_modality_encoder: bool = False,
         use_mlp_goal: bool = False,
+        # Motion prediction parameters
+        use_motion_prediction: bool = False,
+        motion_dim: int = 32,
+        motion_seq_len: int = 8,
     ):
         super().__init__()
         self.device = device
@@ -78,10 +82,22 @@ class MDTTransformer(nn.Module):
         block_size = goal_seq_len + action_seq_len + obs_seq_len + 1
         self.action_seq_len = action_seq_len
         self.use_modality_encoder = use_modality_encoder
+        self.use_motion_prediction = use_motion_prediction
+        self.motion_dim = motion_dim
+        self.motion_seq_len = motion_seq_len
+        
+        # Position embedding size depends on prediction mode
         seq_size = goal_seq_len + action_seq_len
         self.tok_emb = nn.Linear(obs_dim, embed_dim)
         self.incam_embed = nn.Linear(self.obs_dim, self.embed_dim)
         self.pos_emb = nn.Parameter(torch.zeros(1, seq_size, embed_dim))
+        
+        # Motion position embedding (only created if needed)
+        if use_motion_prediction:
+            seq_size_motion = goal_seq_len + motion_seq_len
+            self.pos_emb_motion = nn.Parameter(torch.zeros(1, seq_size_motion, embed_dim))
+        else:
+            self.pos_emb_motion = None
         self.drop = nn.Dropout(embed_pdrob)
         self.cond_mask_prob = goal_drop
         self.use_rot_embed = use_rot_embed
@@ -165,6 +181,7 @@ class MDTTransformer(nn.Module):
             nn.Linear(embed_dim * 2, embed_dim),
         ).to(self.device)
 
+        # Action prediction layers (original)
         self.action_emb = nn.Linear(action_dim, embed_dim)
 
         if linear_output:
@@ -175,6 +192,18 @@ class MDTTransformer(nn.Module):
                 nn.GELU(),
                 nn.Linear(embed_dim, self.action_dim)
             )
+
+        # Motion prediction layers (parallel path)
+        if use_motion_prediction:
+            self.motion_emb = nn.Linear(motion_dim, embed_dim)
+            if linear_output:
+                self.motion_pred = nn.Linear(embed_dim, motion_dim)
+            else:
+                self.motion_pred = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim),
+                    nn.GELU(),
+                    nn.Linear(embed_dim, motion_dim)
+                )
 
         if proprio_dim is not None:
             self.proprio_emb = nn.Sequential(
@@ -202,11 +231,34 @@ class MDTTransformer(nn.Module):
             torch.nn.init.ones_(module.weight)
         elif isinstance(module, MDTTransformer):
             torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
+            if module.pos_emb_motion is not None:
+                torch.nn.init.normal_(module.pos_emb_motion, mean=0.0, std=0.02)
 
-    def forward(self, states, actions, goals, sigma, uncond: Optional[bool] = False):
-        context = self.enc_only_forward(states, actions, goals, sigma, uncond)
-        pred_actions = self.dec_only_forward(context, actions, sigma)
-        return pred_actions
+    def forward(self, states, actions, goals, sigma, uncond: Optional[bool] = False, use_motion: Optional[bool] = None):
+        """
+        Forward pass supporting both action and motion prediction.
+        
+        Args:
+            states: Robot state observations
+            actions: Either robot actions [B, 10, 7] or motion embeddings [B, 8, 32]
+            goals: Goal observations
+            sigma: Diffusion noise level
+            uncond: Whether to use unconditional generation
+            use_motion: Override to specify prediction mode. If None, uses self.use_motion_prediction
+        
+        Returns:
+            Predicted actions or motion embeddings
+        """
+        use_motion = use_motion if use_motion is not None else self.use_motion_prediction
+        
+        if use_motion:
+            context = self.enc_only_forward_motion(states, actions, goals, sigma, uncond)
+            pred_outputs = self.dec_only_forward_motion(context, actions, sigma)
+        else:
+            context = self.enc_only_forward(states, actions, goals, sigma, uncond)
+            pred_outputs = self.dec_only_forward(context, actions, sigma)
+        
+        return pred_outputs
 
     def enc_only_forward(self, states, actions, goals, sigma, uncond: Optional[bool] = False):
         emb_t = self.process_sigma_embeddings(sigma) if not self.use_ada_conditioning else None
@@ -276,6 +328,31 @@ class MDTTransformer(nn.Module):
         context = self.encoder(input_seq)
 
         return context
+    
+    def forward_enc_only_motion(self, states, motion_embeds, goals, sigma, uncond: Optional[bool] = False):
+        b, t, dim = states['static'].size()
+        assert t <= self.block_size, "Cannot forward, model block size is exhausted."
+
+        emb_t = self.process_sigma_embeddings(sigma) if not self.use_ada_conditioning else None
+        goals = self.preprocess_goals(goals, t, uncond)
+        state_embed, proprio_states = self.process_state_embeddings(states)
+        goal_embed = self.process_goal_embeddings(goals, states)
+        motion_embed = self.motion_emb(motion_embeds)
+
+        if self.use_abs_pos_emb:
+            goal_x, state_x, motion_x, proprio_x = self.apply_position_embeddings_motion(
+                goal_embed, state_embed, motion_embed, proprio_states, t
+            )
+        else:
+            goal_x = self.drop(goal_embed)
+            state_x = self.drop(state_embed)
+            motion_x = self.drop(motion_embed)
+            proprio_x = self.drop(proprio_states) if proprio_states is not None else None
+
+        input_seq = self.concatenate_inputs(emb_t, goal_x, state_x, motion_x, proprio_x, uncond)
+        context = self.encoder(input_seq)
+
+        return context
 
     def process_goal_embeddings(self, goals, states):
         if self.use_modality_encoder and 'modality' in states and states['modality'] == 'lang':
@@ -333,3 +410,52 @@ class MDTTransformer(nn.Module):
             input_seq = torch.cat([emb_t, state_x, action_x, proprio_x], dim=1) if proprio_x is not None else torch.cat([emb_t, state_x], dim=1)
 
         return input_seq
+
+    # ========== Motion Prediction Path ==========
+    
+    def enc_only_forward_motion(self, states, motion_embeds, goals, sigma, uncond: Optional[bool] = False):
+        """Encoder forward for motion embedding prediction"""
+        emb_t = self.process_sigma_embeddings(sigma) if not self.use_ada_conditioning else None
+        goals = self.preprocess_goals(goals, 1, uncond)
+        state_embed, proprio_states = self.process_state_embeddings(states)
+        goal_embed = self.goal_emb(goals)
+        motion_embed = self.motion_emb(motion_embeds)
+
+        if self.use_abs_pos_emb:
+            goal_x, state_x, motion_x, proprio_x = self.apply_position_embeddings_motion(
+                goal_embed, state_embed, motion_embed, proprio_states, 1
+            )
+        else:
+            goal_x = self.drop(goal_embed)
+            state_x = self.drop(state_embed)
+            motion_x = self.drop(motion_embed)
+            proprio_x = self.drop(proprio_states) if proprio_states is not None else None
+
+        input_seq = self.concatenate_inputs(emb_t, goal_x, state_x, motion_x, proprio_x, uncond)
+        context = self.encoder(input_seq)
+        self.latent_encoder_emb = context
+        return context
+
+    def dec_only_forward_motion(self, context, motion_embeds, sigma):
+        """Decoder forward for motion embedding prediction"""
+        emb_t = self.process_sigma_embeddings(sigma)
+        motion_embed = self.motion_emb(motion_embeds)
+        motion_x = self.drop(motion_embed)
+
+        if self.use_ada_conditioning:
+            x = self.decoder(motion_x, emb_t, context)
+        else:
+            x = self.decoder(motion_x, context)
+
+        pred_motion_embeds = self.motion_pred(x)
+        return pred_motion_embeds
+    
+    def apply_position_embeddings_motion(self, goal_embed, state_embed, motion_embed, proprio_states, t):
+        """Apply position embeddings for motion prediction path"""
+        position_embeddings = self.pos_emb_motion
+        goal_x = self.drop(goal_embed + position_embeddings[:, :self.goal_seq_len, :])
+        state_x = self.drop(state_embed + position_embeddings[:, self.goal_seq_len:(self.goal_seq_len + t), :])
+        # Motion uses positions starting from index 1 (after goal)
+        motion_x = self.drop(motion_embed + position_embeddings[:, 1:, :])
+        proprio_x = self.drop(proprio_states + position_embeddings[:, self.goal_seq_len:(self.goal_seq_len + t), :]) if proprio_states is not None else None
+        return goal_x, state_x, motion_x, proprio_x

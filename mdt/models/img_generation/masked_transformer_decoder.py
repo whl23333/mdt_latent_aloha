@@ -225,13 +225,13 @@ class MaskedTransformerImgDecoder(nn.Module):
         
         visible_patches = rearrange(visible_ctx_patches, "bsz ctx seq embed -> bsz (ctx seq) embed")
         
-        visible_per_frame = (visible_patches.shape[1]) // 2
+        visible_per_frame = (visible_patches.shape[1]) // self.num_images
         
         # Add Mask Tokens to Sequence and Unshuffle
         if self.symmetric_mask:
-            mask_tokens = self.mask_token.repeat(visible_patches.shape[0], 2, restore_idxs.shape[1] - visible_per_frame, 1)
+            mask_tokens = self.mask_token.repeat(visible_patches.shape[0], self.num_images, restore_idxs.shape[1] - visible_per_frame, 1)
         else:
-            mask_tokens = self.mask_token.repeat(visible_patches.shape[0], 2, restore_idxs.shape[2] - visible_per_frame, 1)
+            mask_tokens = self.mask_token.repeat(visible_patches.shape[0], self.num_images, restore_idxs.shape[2] - visible_per_frame, 1)
         
         projected_ctx_patches = rearrange(visible_patches, "bsz (ctx seq) embed -> bsz ctx seq embed", ctx=self.num_images)
         concatenated_ctx_patches = torch.cat([projected_ctx_patches, mask_tokens], dim=2)
@@ -239,7 +239,7 @@ class MaskedTransformerImgDecoder(nn.Module):
             unshuffled_ctx_patches = torch.gather(
                 concatenated_ctx_patches,
                 dim=2,
-                index=restore_idxs[:, None, ..., None].repeat(1, 2, 1, self.decoder_embed_dim),
+                index=restore_idxs[:, None, ..., None].repeat(1, self.num_images, 1, self.decoder_embed_dim),
             )
         else:
             unshuffled_ctx_patches = torch.gather(
@@ -254,7 +254,7 @@ class MaskedTransformerImgDecoder(nn.Module):
         decoder_ctx_patches_pe = unshuffled_ctx_patches + (
             self.decoder_pe[None, ...]
         )
-        decoder_ctx_patches = decoder_ctx_patches_pe + self.ctx_dec_pe[:, :2, ...]
+        decoder_ctx_patches = decoder_ctx_patches_pe + self.ctx_dec_pe[:, :self.num_images, ...]
         decoder_patches = rearrange(decoder_ctx_patches, "bsz ctx seq embed -> bsz (ctx seq) embed")
         
         # add context embeddings
@@ -280,24 +280,28 @@ class MaskedTransformerImgDecoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Reconstruction Loss...
         assert self.norm_pixel_loss, "`norm_pixel_loss` should always be true... false only for visualizations!"
-        targets = self.patchify(imgs)
+        targets = self.patchify(imgs)  # [B, num_images, num_patches, patch_dim]
 
-        # Split targets into 0 and K --> do the same for ctx_reconstructions
-        zero_target, k_target = targets[:, 0, ...], targets[:, 1, ...]
-        zero_reconstruction, k_reconstruction = ctx_reconstructions[:, 0, ...], ctx_reconstructions[:, 1, ...]
-
-        # Compute mean losses per patch first...
-        zero_mse, k_mse = (zero_reconstruction - zero_target) ** 2, (k_reconstruction - k_target) ** 2
-        zero_avg_loss_per_patch, k_avg_loss_per_patch = zero_mse.mean(dim=-1), k_mse.mean(dim=-1)
-
-        # Compute reconstruction losses...
-        if self.symmetric_mask:
-            zero_loss = (zero_avg_loss_per_patch * mask).sum() / mask.sum() 
-            k_loss = (k_avg_loss_per_patch * mask).sum() / mask.sum()
-        else:
-            zero_loss = (zero_avg_loss_per_patch * mask[:, 0]).sum() / mask[:, 0].sum() 
-            k_loss = (k_avg_loss_per_patch * mask[:, 1]).sum() / mask[:, 1].sum()
-        reconstruction_loss = (zero_loss + k_loss) / 2
+        # Compute loss for each image
+        losses = []
+        for i in range(self.num_images):
+            target = targets[:, i, ...]  # [B, num_patches, patch_dim]
+            reconstruction = ctx_reconstructions[:, i, ...]  # [B, num_patches, patch_dim]
+            
+            # Compute MSE per patch
+            mse = (reconstruction - target) ** 2
+            avg_loss_per_patch = mse.mean(dim=-1)  # [B, num_patches]
+            
+            # Apply mask and compute loss
+            if self.symmetric_mask:
+                img_loss = (avg_loss_per_patch * mask).sum() / mask.sum()
+            else:
+                img_loss = (avg_loss_per_patch * mask[:, i]).sum() / mask[:, i].sum()
+            
+            losses.append(img_loss)
+        
+        # Average across all images
+        reconstruction_loss = sum(losses) / len(losses)
 
         return reconstruction_loss
     

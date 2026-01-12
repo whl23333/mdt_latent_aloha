@@ -94,7 +94,7 @@ class GCDenoiser(nn.Module):
             The output of the forward pass.
         """
         c_skip, c_out, c_in = [append_dims(x, action.ndim) for x in self.get_scalings(sigma)]
-        return self.inner_model.forward_enc_only(state, action * c_in, goal, sigma, **kwargs)
+        return self.inner_model.forward_enc_only(state, action * c_in, goal, sigma, **kwargs) if self.inner_model.use_motion_prediction is False else self.inner_model.forward_enc_only_motion(state, action * c_in, goal, sigma, **kwargs)
 
     def get_params(self):
         return self.inner_model.parameters()

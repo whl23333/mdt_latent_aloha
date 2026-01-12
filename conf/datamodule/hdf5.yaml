@@ -1,0 +1,41 @@
+# Example configuration for using HDF5DataModule with MDT training
+# Place this in conf/datamodule/ directory
+
+_target_: mdt.datasets.hdf5_data_module.HDF5DataModule
+
+# Path to your HDF5 dataset (must contain train/ and val/ subdirectories)
+hdf5_dir: /group/ycyang/jfwu/aloha/data/whl
+
+# Sequence parameters
+sequence_length: 10  # Number of future steps to predict (T)
+chunk_size: 3        # Size of action chunks in raw HDF5 data
+skip_frame: 3        # Frame skip for temporal subsampling
+max_skip_frame: null    # Maximum frame skip for random augmentation (null to disable)
+
+# Data loading
+batch_size: ${batch_size}
+num_workers: 8
+
+# Image parameters
+rgb_shape: [480, 640]  # (height, width)
+rgb_preprocessor: null  # Optional image preprocessing
+
+# Camera selection
+use_left_camera: false  # If true, use left camera instead of right/gripper camera
+camera_key: "observations/images/cam_high"
+qpos_key: "observations/qpos"
+camera_gripper_key: "observations/images/cam_right_wrist"
+camera_left_key: "observations/images/cam_left_wrist"
+
+# Action extraction from chunks
+action_mode: "mean"  # Options: 'first', 'mean', 'last'
+
+# Image generation loss configuration
+gen_frame_source: "last"  # Options: 'last', 'middle', or integer index
+
+# Modalities to use
+modalities: ["vis", "lang"]  # Options: ["vis"], ["lang"], or ["vis", "lang"]
+# transforms_config_path
+transforms_config_path: '/group/ycyang/jfwu/aloha/mdt_policy/conf/datamodule/transforms/aloha_transforms.yaml'
+latent_motion_tokenizer_cfg_path: '/group/ycyang/jfwu/aloha/mdt_policy/mdt/models/latent_motion_tokenizer/configs/models/model__3d_simple_sngl_dcdr.yaml'
+latent_motion_tokenizer_ckpt_path: null

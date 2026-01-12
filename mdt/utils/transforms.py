@@ -78,7 +78,7 @@ class RandomShiftsAug(nn.Module):
     def forward(self, x):
         x = x.float()
         n, c, h, w = x.size()
-        assert h == w
+        assert h == w, f"width and height must be equal, got {h} and {w}"
         padding = tuple([self.pad] * 4)
         x = F.pad(x, padding, "replicate")
         eps = 1.0 / (h + 2 * self.pad)

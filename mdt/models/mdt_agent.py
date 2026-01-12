@@ -23,6 +23,10 @@ from mdt.models.perceptual_encoders.no_encoder import NoEncoder
 from mdt.models.networks.transformers.transformer_blocks import ClipStyleProjection
 from mdt.callbacks.ema import EMA
 from mdt.models.perceptual_encoders.resnets import BesoResNetEncoder
+import os
+import sys
+LATENT_MOTION_TOKENIZER_PATH = "/group/ycyang/jfwu/aloha/mdt_policy/mdt/models/"
+sys.path.insert(0, LATENT_MOTION_TOKENIZER_PATH)
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +72,9 @@ class MDTAgent(pl.LightningModule):
         use_text_not_embedding: bool = False,
         ckpt_path=None,
         seed: int = 42,
+        pred_latent_motion_embeddings: bool = False,
+        latent_motion_dim: int = 32,
+        per_latent_motion_len: int = 8,
     ):
         super(MDTAgent, self).__init__()
         self.latent_dim = latent_dim
@@ -118,8 +125,51 @@ class MDTAgent(pl.LightningModule):
         self.clip_loss_type = 'symmetric'
         self.logit_scale = torch.nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.ema_callback_idx = None
+        self.pred_latent_motion_embeddings = pred_latent_motion_embeddings
+        self.latent_motion_dim = latent_motion_dim
+        self.per_latent_motion_len = per_latent_motion_len
+        
+        
         if ckpt_path is not None:
             self.load_pretrained_parameters(ckpt_path)
+        if self.pred_latent_motion_embeddings:
+            print("MDT Agent will predict latent motion embeddings during inference.")
+            print(f"Motion prediction: {per_latent_motion_len} tokens of {latent_motion_dim}-dim embeddings")
+    
+    def setup(self, stage: str):
+        """
+        Called at the beginning of fit and test, initialize tokenizer from datamodule.
+        """
+        if stage == 'fit' and self.pred_latent_motion_embeddings:
+            # Access datamodule to get tokenizer config
+            datamodule = self.trainer.datamodule
+            if hasattr(datamodule, 'train_datasets'):
+                modality = datamodule.modalities[0]
+                train_ds = datamodule.train_datasets[modality]
+                if hasattr(train_ds, 'latent_motion_tokenizer_cfg_path') and train_ds.latent_motion_tokenizer_cfg_path is not None:
+                    print("\n" + "="*60)
+                    print("Initializing latent motion tokenizer in MDTAgent...")
+                    latent_motion_tokenzier_cfg = OmegaConf.load(train_ds.latent_motion_tokenizer_cfg_path)
+                    self.latent_motion_tokenizer = hydra.utils.instantiate(latent_motion_tokenzier_cfg)
+                    
+                    if train_ds.latent_motion_tokenizer_ckpt_path is not None:
+                        print(f"Loading tokenizer weights from {train_ds.latent_motion_tokenizer_ckpt_path}...")
+                        state_dict = torch.load(train_ds.latent_motion_tokenizer_ckpt_path, map_location='cpu')
+                        missed_keys, unexpected_keys = self.latent_motion_tokenizer.load_state_dict(
+                            state_dict['model'], strict=False
+                        )
+                        missed_root_keys = set([k.split('.')[0] for k in missed_keys])
+                        print(f"  Missed keys: {missed_root_keys}, unexpected keys: {unexpected_keys}")
+                    else:
+                        print("Warning: tokenizer_ckpt_path is None, using random weights.")
+                    
+                    # Freeze tokenizer and move to GPU
+                    for param in self.latent_motion_tokenizer.parameters():
+                        param.requires_grad = False
+                    self.latent_motion_tokenizer.eval()
+                    self.latent_motion_tokenizer = self.latent_motion_tokenizer.to(self.device)
+                    print(f"Tokenizer initialized on device: {self.device}")
+                    print("="*60 + "\n")
 
     def load_pretrained_parameters(self, ckpt_path):
         """
@@ -162,6 +212,9 @@ class MDTAgent(pl.LightningModule):
             {"params": self.clip_proj.parameters(), "weight_decay": self.optimizer_config.obs_encoder_weight_decay},
             {"params": self.logit_scale, "weight_decay":self.optimizer_config.obs_encoder_weight_decay},
         ])
+        
+        # Note: motion_emb and motion_pred layers are inside model.inner_model
+        # and are already included in the first optim_group
 
         optimizer = torch.optim.AdamW(optim_groups, lr=self.optimizer_config.learning_rate, betas=self.optimizer_config.betas)
 
@@ -191,13 +244,55 @@ class MDTAgent(pl.LightningModule):
         self.log("train/grad_norm", total_grad_norm, on_step=True, on_epoch=False, sync_dist=True)
         self.log("train/param_norm", total_param_norm, on_step=True, on_epoch=False, sync_dist=True)
 
-    
-    def clip_extra_forward(self, perceptual_emb, latent_goal, actions, sigmas, noise):
+    def compute_motion_embeddings_batch(self, rgb_initial_1, rgb_future_1, rgb_initial_2, rgb_future_2):
+        """
+        Batch compute motion embeddings using the latent motion tokenizer.
+        
+        Args:
+            rgb_initial_1: [B, 1, 3, H, W] initial images from camera 1
+            rgb_future_1: [B, 1, 3, H, W] future images from camera 1
+            rgb_initial_2: [B, 1, 3, H, W] initial images from camera 2
+            rgb_future_2: [B, 1, 3, H, W] future images from camera 2
+            
+        Returns:
+            motion_embeds: [B, per_latent_motion_len, latent_motion_dim]
+        """
+        if self.latent_motion_tokenizer is None:
+            raise ValueError("Latent motion tokenizer is not initialized!")
+        
+        # Ensure inputs are on the same device as tokenizer
+        device = next(self.latent_motion_tokenizer.parameters()).device
+        rgb_initial_1 = rgb_initial_1.to(device).squeeze(1)  # [B, 3, H, W]
+        rgb_future_1 = rgb_future_1.to(device).squeeze(1)  # [B, 3, H, W]
+        rgb_initial_2 = rgb_initial_2.to(device).squeeze(1)  # [B, 3, H, W]
+        rgb_future_2 = rgb_future_2.to(device).squeeze(1)  # [B, 3, H, W]
+        
+        with torch.no_grad():
+            # Get motion token indices: [B, per_latent_motion_len]
+            motion_token_indices = self.latent_motion_tokenizer(
+                cond_pixel_values1=rgb_initial_1,
+                target_pixel_values1=rgb_future_1,
+                cond_pixel_values2=rgb_initial_2,
+                target_pixel_values2=rgb_future_2,
+                return_motion_token_ids_only=True
+            ) # [B, per_latent_motion_len]
+            
+            # Convert indices to embeddings: [B, per_latent_motion_len, latent_motion_dim]
+            batch_size = motion_token_indices.shape[0]
+            motion_embeds = torch.stack([
+                self.latent_motion_tokenizer.vector_quantizer.get_codebook_entry(motion_token_indices[i])
+                for i in range(batch_size)
+            ], dim=0)
+        
+        return motion_embeds
 
-        self.model.train()
-        noised_input = actions + noise * append_dims(sigmas, actions.ndim)
-        context = self.model.forward_context_only(perceptual_emb, noised_input, latent_goal, sigmas)
-        return context 
+    
+    # def clip_extra_forward(self, perceptual_emb, latent_goal, actions, sigmas, noise):
+
+    #     self.model.train()
+    #     noised_input = actions + noise * append_dims(sigmas, actions.ndim)
+    #     context = self.model.forward_context_only(perceptual_emb, noised_input, latent_goal, sigmas)
+    #     return context 
 
     def training_step(self, batch: Dict[str, Dict], batch_idx: int, dataloader_idx: int = 0) -> torch.Tensor:  # type: ignore
         """
@@ -228,10 +323,25 @@ class MDTAgent(pl.LightningModule):
             # Compute the required embeddings
             perceptual_emb, latent_goal, image_latent_goal = self.compute_input_embeddings(dataset_batch)
 
-            act_loss, sigmas, noise = self.diffusion_loss(
+            if self.pred_latent_motion_embeddings:
+                # Batch compute motion tokens using tokenizer on GPU
+                motion_embeds_gt = self.compute_motion_embeddings_batch(
+                    dataset_batch['rgb_initial_1'],
+                    dataset_batch['rgb_future_1'],
+                    dataset_batch['rgb_initial_2'],
+                    dataset_batch['rgb_future_2']
+                )  # (B, per_latent_motion_len, latent_motion_dim)
+                
+                act_loss, sigmas, noise = self.motion_diffusion_loss(
                     perceptual_emb,
                     latent_goal,
-                    dataset_batch["actions"],
+                    motion_embeds_gt
+                )
+            else:
+                act_loss, sigmas, noise = self.diffusion_loss(
+                        perceptual_emb,
+                        latent_goal,
+                        dataset_batch["actions"],
                 )
             latent_encoder_emb = self.model.inner_model.latent_encoder_emb
 
@@ -241,7 +351,8 @@ class MDTAgent(pl.LightningModule):
                 rgb_gripper_goal = dataset_batch["rgb_obs"]['gen_gripper']
                 img_gen_frame_diff = dataset_batch['future_frame_diff'] if "future_frame_diff" in dataset_batch else 3
                 # combine both goal images
-                rgb_pred_goal = torch.cat([rgb_static_goal, rgb_gripper_goal], dim=1)
+                # rgb_pred_goal = torch.cat([rgb_static_goal, rgb_gripper_goal], dim=1)
+                rgb_pred_goal = torch.stack([rgb_static_goal, rgb_gripper_goal], dim=1)
                 img_gen_embed =  latent_encoder_emb
                 img_gen_loss_part = self.compute_img_gen_loss(img_gen_embed, rgb_pred_goal, 
                     img_gen_frame_diff=img_gen_frame_diff)
@@ -298,15 +409,38 @@ class MDTAgent(pl.LightningModule):
             # Compute the required embeddings
             perceptual_emb, latent_goal, image_latent_goal = self.compute_input_embeddings(dataset_batch)
 
-            # predict the next action sequence
-            action_pred = self.denoise_actions(
-                torch.zeros_like(latent_goal).to(latent_goal.device),
-                perceptual_emb,
-                latent_goal,
-                inference=True,
-            )
-            # compute the mse action loss
-            pred_loss = torch.nn.functional.mse_loss(action_pred, dataset_batch["actions"])
+            # predict the next action sequence or motion embeddings
+            if self.pred_latent_motion_embeddings:
+                motion_embeds_pred = self.denoise_motion_embeddings(
+                    torch.zeros_like(latent_goal).to(latent_goal.device),
+                    perceptual_emb,
+                    latent_goal,
+                    inference=True,
+                )
+                motion_embeds_gt = self.compute_motion_embeddings_batch(
+                    dataset_batch['rgb_initial_1'],
+                    dataset_batch['rgb_future_1'],
+                    dataset_batch['rgb_initial_2'],
+                    dataset_batch['rgb_future_2']
+                )  # (B, per_latent_motion_len, latent_motion_dim)
+                pred_loss = torch.nn.functional.mse_loss(motion_embeds_pred, motion_embeds_gt)
+                
+                # Convert embeddings to indices if tokenizer is available in dataset_batch
+                if 'latent_motion_tokenizer' in dataset_batch and 'gt_latent_motion_indices' in dataset_batch:
+                    tokenizer = dataset_batch['latent_motion_tokenizer']
+                    # Use tokenizer's vector quantizer to find nearest codebook entries
+                    motion_indices_pred = tokenizer.vector_quantizer.get_code_indices(motion_embeds_pred)
+                    gt_indices = dataset_batch['gt_latent_motion_indices']
+                    indices_accuracy = (motion_indices_pred == gt_indices).float().mean()
+                    self.log(f"val_act/{self.modality_scope}_indices_accuracy", indices_accuracy, sync_dist=True)
+            else:
+                action_pred = self.denoise_actions(
+                    torch.zeros_like(latent_goal).to(latent_goal.device),
+                    perceptual_emb,
+                    latent_goal,
+                    inference=True,
+                )
+                pred_loss = torch.nn.functional.mse_loss(action_pred, dataset_batch["actions"])
             latent_encoder_emb = self.model.inner_model.latent_encoder_emb
             val_total_act_loss_pp += pred_loss
             
@@ -316,7 +450,8 @@ class MDTAgent(pl.LightningModule):
                 rgb_gripper_goal = dataset_batch["rgb_obs"]['gen_gripper']
                 img_gen_frame_diff = dataset_batch['future_frame_diff'] if "future_frame_diff" in dataset_batch else 3
                 # combine both goal images
-                rgb_pred_goal = torch.cat([rgb_static_goal, rgb_gripper_goal], dim=1)
+                # rgb_pred_goal = torch.cat([rgb_static_goal, rgb_gripper_goal], dim=1)
+                rgb_pred_goal = torch.stack([rgb_static_goal, rgb_gripper_goal], dim=1)
                 
                 img_gen_embed = latent_encoder_emb
 
@@ -344,9 +479,9 @@ class MDTAgent(pl.LightningModule):
         # 1. extract the revelant visual observations
         latent_goal = None
         rgb_static_goal = dataset_batch["rgb_obs"]['rgb_static'][:, -1]
-        rgb_static = dataset_batch["rgb_obs"]['rgb_static'][:, :-1]
+        rgb_static = dataset_batch["rgb_obs"]['rgb_static'][:, :1]
 
-        rgb_gripper = dataset_batch["rgb_obs"]['rgb_gripper'][:, :-1]
+        rgb_gripper = dataset_batch["rgb_obs"]['rgb_gripper'][:, :1]
 
         # 2. Compute the latent goal embedding for the visual goal
         if not isinstance(self.visual_goal, NoEncoder):
@@ -424,14 +559,30 @@ class MDTAgent(pl.LightningModule):
         """
         if "lang" in self.modality_scope:
             latent_language_embed = self.model.inner_model.latent_encoder_emb
-            
-            latent_vis_embed = self.clip_extra_forward(
+
+            if self.pred_latent_motion_embeddings:
+                motion_embeds_gt = self.compute_motion_embeddings_batch(
+                    dataset_batch['rgb_initial_1'],
+                    dataset_batch['rgb_future_1'],
+                    dataset_batch['rgb_initial_2'],
+                    dataset_batch['rgb_future_2']
+                )  # (B, per_latent_motion_len, latent_motion_dim)
+                latent_vis_embed = self.clip_extra_forward(
                     perceptual_emb,
                     image_latent_goal,
-                    dataset_batch["actions"],
+                    motion_embeds_gt,
                     sigma,  # Assuming you don't need sigmas and noise here
                     noise
                 )
+            else:
+            
+                latent_vis_embed = self.clip_extra_forward(
+                        perceptual_emb,
+                        image_latent_goal,
+                        dataset_batch["actions"],
+                        sigma,  # Assuming you don't need sigmas and noise here
+                        noise
+                    )
             latent_language_embed = self.clip_proj(latent_language_embed)
             latent_vis_embed = self.clip_proj(latent_vis_embed)
 
@@ -469,7 +620,10 @@ class MDTAgent(pl.LightningModule):
         """
         Log the training metrics.
         """
-        self.log("train/action_loss", action_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=total_bs)
+        if self.pred_latent_motion_embeddings:
+            self.log("train/motion_emb_loss", action_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=total_bs)
+        else:
+            self.log("train/action_loss", action_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=total_bs)
         self.log("train/total_loss", total_loss, on_step=False, on_epoch=True, sync_dist=True,batch_size=total_bs)
         self.log("train/cont_loss", cont_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=total_bs)
         self.log("train/img_gen_loss", img_gen_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=total_bs)
@@ -501,6 +655,38 @@ class MDTAgent(pl.LightningModule):
         loss, _ = self.model.loss(perceptual_emb, actions, latent_goal, noise, sigmas)
         return loss, sigmas, noise
     
+    def motion_diffusion_loss(
+        self,
+        perceptual_emb: torch.Tensor,
+        latent_goal: torch.Tensor,
+        motion_embeds_gt: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Computes diffusion loss for motion embeddings directly in embedding space.
+        Args:
+            motion_embeds_gt: (B, per_latent_motion_len, latent_motion_dim)
+        Returns:
+            (loss, sigmas, noise)
+        """
+        self.model.train()
+        batch_size = motion_embeds_gt.shape[0]
+        
+        # Apply diffusion directly in motion embedding space
+        sigmas = self.make_sample_density()(shape=(batch_size,), device=self.device).to(self.device)
+        noise = torch.randn_like(motion_embeds_gt).to(self.device)
+        
+        # Call model with use_motion=True to use motion prediction path
+        loss, _ = self.model.loss(
+            perceptual_emb, 
+            motion_embeds_gt, 
+            latent_goal, 
+            noise, 
+            sigmas,
+            use_motion=True
+        )
+        
+        return loss, sigmas, noise
+    
     def denoise_actions(  # type: ignore
         self,
         latent_plan: torch.Tensor,
@@ -529,6 +715,51 @@ class MDTAgent(pl.LightningModule):
         actions = self.sample_loop(sigmas, x, input_state, latent_goal, latent_plan, self.sampler_type, extra_args)
 
         return actions
+    
+    def denoise_motion_embeddings(
+        self,
+        latent_plan: torch.Tensor,
+        perceptual_emb: torch.Tensor,
+        latent_goal: torch.Tensor,
+        inference: Optional[bool] = False,
+        extra_args={}
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Denoise motion embeddings directly in embedding space.
+        Returns: (motion_embeddings,) - Note: indices conversion needs tokenizer
+        """
+        if inference:
+            sampling_steps = self.num_sampling_steps
+        else:
+            sampling_steps = 10
+        
+        self.model.eval()
+        if len(latent_goal.shape) < len(perceptual_emb['static'].shape if isinstance(perceptual_emb, dict) else perceptual_emb.shape): 
+            latent_goal = latent_goal.unsqueeze(1)
+        
+        input_state = perceptual_emb
+        sigmas = self.get_noise_schedule(sampling_steps, self.noise_scheduler)
+        if len(latent_goal.shape) == 2:
+            latent_goal = einops.rearrange(latent_goal, 'b d -> b 1 d')
+        
+        batch_size = len(latent_goal)
+        
+        # Initialize noise in motion embedding space
+        x = torch.randn(
+            (batch_size, self.per_latent_motion_len, self.latent_motion_dim), 
+            device=self.device
+        ) * self.sigma_max
+        
+        # Denoise directly in motion embedding space with use_motion=True
+        motion_embeddings = self.sample_loop(
+            sigmas, x, input_state, latent_goal, latent_plan, 
+            self.sampler_type, extra_args, use_motion=True
+        )
+        
+        # Note: Converting embeddings to indices requires the tokenizer's vector quantizer
+        # This should be done in the validation step where tokenizer is available
+        
+        return motion_embeddings
 
     def make_sample_density(self):
         """ 
@@ -579,19 +810,23 @@ class MDTAgent(pl.LightningModule):
         goal: torch.Tensor, 
         latent_plan: torch.Tensor,
         sampler_type: str,
-        extra_args={}, 
+        extra_args={},
+        use_motion: bool = False,
         ):
         """
         Main method to generate samples depending on the chosen sampler type. DDIM is the default as it works well in all settings.
+        Args:
+            use_motion: If True, use motion embedding prediction path in the model
         """
         s_churn = extra_args['s_churn'] if 's_churn' in extra_args else 0
         s_min = extra_args['s_min'] if 's_min' in extra_args else 0
         use_scaler = extra_args['use_scaler'] if 'use_scaler' in extra_args else False
-        keys = ['s_churn', 'keep_last_actions']
+        keys = ['s_churn', 'keep_last_actions', 'use_motion']
+        extra_args['use_motion'] = use_motion  # Add use_motion to extra_args
         if bool(extra_args):
-            reduced_args = {x:extra_args[x] for x in keys}
+            reduced_args = {x:extra_args[x] for x in keys if x in extra_args}
         else:
-            reduced_args = {}
+            reduced_args = {'use_motion': use_motion}
         if use_scaler:
             scaler = self.scaler
         else:

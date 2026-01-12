@@ -1,0 +1,91 @@
+import pyrootutils
+pyrootutils.setup_root(__file__, indicator='.project-root', pythonpath=True, dotenv=True)
+import argparse
+import json
+from torch.utils.data import DataLoader
+import omegaconf
+import hydra
+from functools import partial
+from transformers import AutoTokenizer
+from common.models.model_utils import load_model
+from common.processors.preprocessor_utils import get_rgb_preprocessor
+from latent_motion_tokenizer.src.trainers.latent_motion_tokenizer_trainer import LatentMotionTokenizer_Trainer
+from torch.utils.data import DataLoader
+from functools import partial
+from common.data.data_utils import load_dataset
+from common.data.hdf5_datasets import HDF5Dataset_for_MotoGPT_CALVINLike
+
+def main(cfg):
+    # Prepare Latent Motion Tokenizer
+    latent_motion_tokenizer_config_path = cfg['latent_motion_tokenizer_config_path']
+    print(f"initializing Latent Motion Tokenizer from {latent_motion_tokenizer_config_path} ...")
+    latent_motion_tokenizer_config = omegaconf.OmegaConf.load(latent_motion_tokenizer_config_path)
+    latent_motion_tokenizer = hydra.utils.instantiate(latent_motion_tokenizer_config)
+    latent_motion_tokenizer.config = latent_motion_tokenizer_config
+
+    # Prepare rgb_processor
+    rgb_preprocessor = get_rgb_preprocessor(**cfg['rgb_preprocessor_config'])
+
+    # Preprepare Dataloaders
+    dataset_config_path = cfg['dataset_config_path']
+    extra_data_config = {
+        'sequence_length': 1,
+        'do_extract_future_frames': True,
+        'do_extract_action': False
+    }
+    dataset_config = omegaconf.OmegaConf.load(dataset_config_path)
+    # train_dataset, eval_dataset = load_dataset(dataset_config_path, extra_data_config)
+    train_dataset = HDF5Dataset_for_MotoGPT_CALVINLike(
+        hdf5_dir=dataset_config['hdf5_dir'],
+        split='train',
+        skip_frame=dataset_config['skip_frame'],
+        sequence_length=extra_data_config['sequence_length'],
+        do_extract_future_frames=extra_data_config['do_extract_future_frames'],
+        do_extract_action=extra_data_config['do_extract_action'],
+        rgb_shape=dataset_config['rgb_shape'],
+    )
+    eval_dataset = HDF5Dataset_for_MotoGPT_CALVINLike(
+        hdf5_dir=dataset_config['hdf5_dir'],
+        split='train',
+        skip_frame=dataset_config['skip_frame'],
+        sequence_length=extra_data_config['sequence_length'],
+        do_extract_future_frames=extra_data_config['do_extract_future_frames'],
+        do_extract_action=extra_data_config['do_extract_action'],
+        rgb_shape=dataset_config['rgb_shape'],
+    )
+    dataloader_cls = partial(
+        DataLoader, 
+        pin_memory=True, # Accelerate data reading
+        shuffle=True,
+        persistent_workers=True,
+        num_workers=cfg['dataloader_config']['workers_per_gpu'],
+        batch_size=cfg['dataloader_config']['bs_per_gpu'],
+        prefetch_factor= cfg['dataloader_config']['prefetch_factor']
+    )
+    train_dataloader = dataloader_cls(train_dataset)
+    eval_dataloader = dataloader_cls(eval_dataset)
+    
+    # Prepare Trainer
+    trainer = LatentMotionTokenizer_Trainer(
+        latent_motion_tokenizer=latent_motion_tokenizer,
+        rgb_preprocessor=rgb_preprocessor,
+        train_dataloader=train_dataloader,
+        eval_dataloader=eval_dataloader,
+        bs_per_gpu=cfg['dataloader_config']['bs_per_gpu'],
+        **cfg['training_config']
+    )
+
+    # Start Training
+    trainer.train()
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config_path', type=str, default="/home/hlwang/refined_moto/Moto/latent_motion_tokenizer/configs/train/train_aloha.yaml")
+    args = parser.parse_args()
+
+    cfg = omegaconf.OmegaConf.load(args.config_path)
+    main(cfg)
+
+    
+
+

@@ -32,4 +32,7 @@ inner_model:
   use_noise_encoder: False # only relevant for ada_conditioning
   use_modality_encoder: True
   use_mlp_goal: True
+  use_motion_prediction: ${pred_latent_motion_embeddings}
+  motion_seq_len: ${per_latent_motion_len}
+  motion_dim: ${latent_motion_dim}
   

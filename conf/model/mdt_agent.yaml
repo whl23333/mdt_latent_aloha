@@ -24,6 +24,9 @@ use_distributed_clip: True
 use_text_not_embedding: True
 ckpt_path: null
 seed: ${seed}
+pred_latent_motion_embeddings: ${pred_latent_motion_embeddings}
+latent_motion_dim: ${latent_motion_dim}
+per_latent_motion_len: ${per_latent_motion_len}
 
 optimizer:
   _target_: torch.optim.AdamW
