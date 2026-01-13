@@ -72,6 +72,7 @@ class MDTAgent(pl.LightningModule):
         predict_embeddings: bool = False,
         latent_motion_tokenizer: Optional[DictConfig] = None,
         latent_motion_tokenizer_ckpt: Optional[str] = None,
+        latent_motion_view: str = 'single',
         latent_action_num: int = 2,
         ckpt_path=None,
         seed: int = 42,
@@ -128,6 +129,7 @@ class MDTAgent(pl.LightningModule):
         self.clip_loss_type = 'symmetric'
         self.logit_scale = torch.nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.ema_callback_idx = None
+        self.latent_motion_view = latent_motion_view
 
         # Optional latent motion tokenizer for embedding targets
         self.lmt = None
@@ -146,8 +148,9 @@ class MDTAgent(pl.LightningModule):
             self.lmt.eval()
             if latent_motion_tokenizer_ckpt is not None:
                 checkpoint = torch.load(latent_motion_tokenizer_ckpt, map_location='cpu')
-                self.lmt.load_state_dict(checkpoint['state_dict'])
-                print(f"Loaded latent motion tokenizer from {latent_motion_tokenizer_ckpt}")
+                missing_keys, unexpected_keys = self.lmt.load_state_dict(checkpoint, strict=False)
+                missing_root_keys = set([k.split('.')[0] for k in missing_keys])
+                print(f"Loaded latent motion tokenizer from {latent_motion_tokenizer_ckpt}, missing keys: {missing_root_keys}, unexpected keys: {unexpected_keys}")
             else:
                 print("Warning: latent_motion_tokenizer_ckpt is None, using randomly initialized weights.")
         if ckpt_path is not None:
@@ -224,12 +227,12 @@ class MDTAgent(pl.LightningModule):
         self.log("train/param_norm", total_param_norm, on_step=True, on_epoch=False, sync_dist=True)
 
     
-    def clip_extra_forward(self, perceptual_emb, latent_goal, actions, sigmas, noise):
+    # def clip_extra_forward(self, perceptual_emb, latent_goal, actions, sigmas, noise):
 
-        self.model.train()
-        noised_input = actions + noise * append_dims(sigmas, actions.ndim)
-        context = self.model.forward_context_only(perceptual_emb, noised_input, latent_goal, sigmas)
-        return context 
+    #     self.model.train()
+    #     noised_input = actions + noise * append_dims(sigmas, actions.ndim)
+    #     context = self.model.forward_context_only(perceptual_emb, noised_input, latent_goal, sigmas)
+    #     return context 
 
     def training_step(self, batch: Dict[str, Dict], batch_idx: int, dataloader_idx: int = 0) -> torch.Tensor:  # type: ignore
         """
@@ -438,7 +441,11 @@ class MDTAgent(pl.LightningModule):
     def clip_extra_forward(self, perceptual_emb, latent_goal, actions, sigmas, noise):    
         self.model.train()
         noised_input = actions + noise * append_dims(sigmas, actions.ndim)
-        context = self.model.forward_context_only(perceptual_emb, noised_input, latent_goal, sigmas)
+        if self.predict_embeddings:
+            extra_args = {'mode': 'tokens'}
+        else:
+            extra_args = {}
+        context = self.model.forward_context_only(perceptual_emb, noised_input, latent_goal, sigmas, **extra_args)
         return context
 
     def compute_img_gen_loss(self, latent_embeddings, goal_img, store_img=False, img_gen_frame_diff=3, batch_idx=0):
@@ -483,17 +490,27 @@ class MDTAgent(pl.LightningModule):
         assert latent_action_num == self.latent_action_num, f"latent_action_num in dataset ({latent_action_num}) does not match the initialized value ({self.latent_action_num})."
         latent_static = dataset_batch['latent_static']   # (B, T, C, H, W) 
         latent_gripper = dataset_batch["latent_gripper"]  # (B, T, C, H, W) 
+        per_len = self.lmt.m_former.query_num
         assert latent_static.shape[1] == latent_gripper.shape[1] and latent_static.shape[1] == latent_action_num + 1, "latent_static, latent_gripper T should be action_num + 1"
-        assert (latent_action_diff * latent_action_num == self.model.inner_model.token_seq_len), f"latent_action_diff * latent_action_num ({latent_action_diff * latent_action_num}) does not match model token_seq_len ({self.model.inner_model.token_seq_len})"
+        assert (per_len * latent_action_num == self.model.inner_model.token_seq_len), f"latent_action_diff * latent_action_num ({latent_action_diff * latent_action_num}) does not match model token_seq_len ({self.model.inner_model.token_seq_len})"
+        assert (latent_action_diff * latent_action_num == self.model.inner_model.action_seq_len), f"latent_action_diff * latent_action_num ({latent_action_diff * latent_action_num}) does not match model action_seq_len ({self.model.inner_model.action_seq_len})"
         B, T, C, H, W = latent_static.shape
-
-        indices = self.lmt(
-            cond_pixel_values1=latent_static[:, :-1].reshape(-1, C, H, W),
-            target_pixel_values1=latent_static[:, 1:].reshape(-1, C, H, W),
-            cond_pixel_values2=latent_gripper[:, :-1].reshape(-1, C, H, W),
-            target_pixel_values2=latent_gripper[:, 1:].reshape(-1, C, H, W),
-            return_motion_token_ids_only=True,
-        ).reshape(B, latent_action_num * latent_action_diff)
+        if self.latent_motion_view == 'single':
+            # Use only static view for single-view tokenizer
+            indices = self.lmt(
+                cond_pixel_values=latent_static[:, :-1].reshape(-1, C, H, W),
+                target_pixel_values=latent_static[:, 1:].reshape(-1, C, H, W),
+                return_motion_token_ids_only=True,
+            ).reshape(B, latent_action_num * per_len)
+        else:
+            # Use both views for dual-view tokenizer
+            indices = self.lmt(
+                cond_pixel_values1=latent_static[:, :-1].reshape(-1, C, H, W),
+                target_pixel_values1=latent_static[:, 1:].reshape(-1, C, H, W),
+                cond_pixel_values2=latent_gripper[:, :-1].reshape(-1, C, H, W),
+                target_pixel_values2=latent_gripper[:, 1:].reshape(-1, C, H, W),
+                return_motion_token_ids_only=True,
+            ).reshape(B, latent_action_num * per_len)
         # Convert indices -> embeddings via codebook
         embeddings = self.lmt.vector_quantizer.get_codebook_entry(indices)
         # No pad/truncate here; model handles positional alignment via dual embeddings
@@ -505,11 +522,14 @@ class MDTAgent(pl.LightningModule):
         """
         if "lang" in self.modality_scope:
             latent_language_embed = self.model.inner_model.latent_encoder_emb
+            target = dataset_batch["actions"]
+            if self.predict_embeddings:
+                target = self.compute_embedding_targets(dataset_batch)
             
             latent_vis_embed = self.clip_extra_forward(
                     perceptual_emb,
                     image_latent_goal,
-                    dataset_batch["actions"],
+                    target,
                     sigma,  # Assuming you don't need sigmas and noise here
                     noise
                 )
@@ -741,7 +761,7 @@ class MDTAgent(pl.LightningModule):
         elif sampler_type == 'dpmpp_2m_sde':
             x_0 = sample_dpmpp_sde(self.model, state, x_t, goal, sigmas, scaler=scaler, disable=True)
         elif sampler_type == 'ddim':
-            x_0 = sample_ddim(self.model, state, x_t, goal, sigmas, scaler=scaler, disable=True)
+            x_0 = sample_ddim(self.model, state, x_t, goal, sigmas, scaler=scaler, disable=True, extra_args=reduced_args)
         elif sampler_type == 'dpmpp_2s':
             x_0 = sample_dpmpp_2s(self.model, state, x_t, goal, sigmas, scaler=scaler, disable=True)
         elif sampler_type == 'dpmpp_2_with_lms':

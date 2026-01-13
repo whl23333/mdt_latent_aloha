@@ -27,6 +27,7 @@ seed: ${seed}
 predict_embeddings: true
 latent_motion_tokenizer: '/data/250010208/whl/code/Moto/latent_motion_tokenizer/configs/models/model_for_calvin.yaml'
 latent_motion_tokenizer_ckpt: '/data/250010208/whl/results/Moto/latent_motion_tokenizer/outputs/calvin/single_view_b64_gpu4_calvin_D_D/saved_epoch_20_step_40020/pytorch_model.bin'
+latent_motion_view: 'single'
 
 optimizer:
   _target_: torch.optim.AdamW
