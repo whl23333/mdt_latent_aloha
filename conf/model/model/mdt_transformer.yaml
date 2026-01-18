@@ -34,5 +34,5 @@ inner_model:
   use_modality_encoder: True
   use_mlp_goal: True
   token_dim: 32
-  pred_tokens: true
+  pred_tokens: ${predict_embeddings}
   
